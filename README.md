@@ -4,6 +4,24 @@ This project is a **graduate thesis** investigating the performance of a **from-
 The experiments cover both **language modeling** (on WikiText-2) and a synthetic **nearest neighbor search (NNS)** sequence task.
 
 ---
+## 🛠️ Setting Up the Environment
+
+Run the following command from the project root directory to create the environment:
+
+```bash
+conda env create -f environment.yml
+```
+
+Once the environment is created, activate it with:
+
+```bash
+conda activate xlstm2
+```
+
+You're now ready to run the project — mainly through `main.ipynb`.
+
+---
+
 
 ## Project Structure
 
