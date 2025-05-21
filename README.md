@@ -1,6 +1,6 @@
 # xLSTM from Scratch: Benchmarking Against LSTM and Transformer
 
-This project is a **graduate thesis** investigating the performance of a **from-scratch implementation of xLSTM** (extreme LSTM) compared to the official xLSTM library, classic LSTM, and Transformer models.  
+This project is a **graduate thesis** investigating the performance of a **from-scratch implementation of xLSTM**  compared to the official xLSTM library, classic LSTM, and Transformer models.  
 The experiments cover both **language modeling** (on WikiText-2) and a synthetic **nearest neighbor search (NNS)** sequence task.
 
 ---
@@ -9,20 +9,23 @@ The experiments cover both **language modeling** (on WikiText-2) and a synthetic
 
 
 
+```
+
 .
-├── main.ipynb                # Main notebook: run all benchmarks & plots
-├── xlstm\_replica.py          # From-scratch implementation of xLSTM (faithful to paper)
-├── experiments/
-│   ├── lm\_benchmark.py       # Language modeling benchmarks (WikiText-2)
-│   └── nns\_benchmark.py      # Nearest neighbor search (NNS) benchmarks
-├── utils/
-│   ├── data\_preparation.py   # Dataset loaders & synthetic data generation
-│   ├── model\_architectures.py# Baseline model wrappers: LSTM, Transformer, etc.
-│   ├── plotting.py           # Plotting utilities for experiment results
-│   └── training\_loops.py     # Training, evaluation, and scheduler logic
-├── lm\_benchmark\_xlstm\_vs\_lib\_results.json        # Pre-saved LM benchmark results
-├── lm\_benchmark\_baselines\_vs\_xlstm\_results.json  # Pre-saved LM baseline results
-└── ...
+├── main.ipynb                  # Main notebook to run all benchmarks and view results
+├── xlstm_replica.py            # From-scratch implementation of xLSTM components
+├── experiments
+│   ├── lm_benchmark.py         # Logic for Language Modeling benchmarks
+│   └── nns_benchmark.py        # Logic for Nearest Neighbor Search benchmarks
+├── utils
+│   ├── data_preparation.py     # Data loading and preprocessing utilities
+│   ├── model_architectures.py  # Baseline models (LSTM, Transformer) and wrappers
+│   ├── plotting.py             # Utilities for generating result plots
+│   └── training_loops.py       # Training and evaluation loop implementations
+├── lm_benchmark_xlstm_vs_lib_results.json      # LM benchmark results (Scratch vs. Library xLSTM)
+└── lm_benchmark_baselines_vs_xlstm_results.json # LM benchmark results (Baselines vs. xLSTM)
+
+```
 
 
 

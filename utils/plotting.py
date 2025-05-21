@@ -1,4 +1,3 @@
-# utils/plotting.py
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, List, Tuple
@@ -24,7 +23,6 @@ def plot_nns_results(results: Dict[str, float], title: str, ylabel: str, filenam
         original_val = results[model_name] 
         
         text_label = f"{original_val:.4f}" if np.isfinite(original_val) else "N/A"
-        # Adjust text y-position slightly above the bar
         text_y_offset = 0.01 * (plt.gca().get_ylim()[1] - plt.gca().get_ylim()[0]) 
         text_y_pos = yval + text_y_offset if yval >= 0 else yval - text_y_offset
 
@@ -108,7 +106,6 @@ def plot_lm_results(ppl_by_model: Dict[str, List[float]], bin_edges: Tuple[int, 
             for idx, val in enumerate(p_list) 
             if np.isfinite(val) and val > 0 
         ]
-        # Further filter for scaled values if first bin was scaled
         plotted_values_for_log = [pv for pv in plotted_values_for_log if np.isfinite(pv) and pv > 0]
 
         if plotted_values_for_log:

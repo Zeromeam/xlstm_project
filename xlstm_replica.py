@@ -1,10 +1,6 @@
-# -*- coding: utf-8 -*-
+
 """
 Self‑contained re‑implementation of the **xLSTM** building blocks.
-(Previous version: xlstm_replica_v2)
-
-NaN/Inf Mitigation: Cast sensitive terms (m_new, max_log_D) to float32
-before exp(-value) operations in backends when using AMP.
 """
 from __future__ import annotations
 
@@ -507,9 +503,9 @@ class mLSTMLayerConfig:
     embedding_dim: int; context_length: int; num_heads: int = 4; conv1d_kernel_size: int = 4
     qkv_proj_blocksize: int = 4; proj_factor: float = 2.0; bias: bool = False 
     dropout: float = 0.0; _num_blocks: int = 1 
-# In xlstm_replica.py
 
-from torch.nn import SiLU
+
+
 
 
 class mLSTMLayer(nn.Module):
@@ -1113,9 +1109,7 @@ class xLSTMBlockStack(nn.Module):
         current_x_step = x_step
 
         for i, block in enumerate(self.blocks):
-            # Each block's step method expects `state` as a dict, e.g. {"mlstm_layer_state": tuple}
-            # or {"slstm_layer_state": tuple}
-            # The `states` list holds these dictionaries for each block.
+
             block_input_state_dict = states[i] 
             
             current_x_step, returned_block_state_dict = block.step(current_x_step, state=block_input_state_dict)

@@ -1,4 +1,4 @@
-# experiments/nns_benchmark.py
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -34,7 +34,7 @@ NNS_WEIGHT_DECAY = 0.01
 NNS_GRAD_CLIP_NORM = 1.0 
 NNS_PATIENCE = 10 
 
-# --- NNS Model Definitions (ScratchxLSTM_NNS, LibxLSTM_NNS - remain the same) ---
+# --- NNS Model Definitions 
 class ScratchxLSTM_NNS(nn.Module):
     def __init__(self):
         super().__init__()
