@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Union, Literal, List, Dict # Added Union, Literal, List, Dict
+from typing import Optional, Tuple, Union, Literal, List, Dict 
 
 import torch
 from torch import nn
@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from copy import deepcopy 
 
 # Helper initialisation utilities: bias_linspace_init_, small_init_init_, wang_init_
-def bias_linspace_init_(bias: torch.Tensor, *, start: float = 3.4, end: float = 6.0): 
+def bias_linspace_init_(bias: torch.Tensor, *, start: float = 3.4, end: float = 6.0):
     with torch.no_grad():
-        bias.copy_(torch.linspace(start, end, bias.numel(), dtype=bias.dtype, device=bias.device))
+        source_tensor = torch.linspace(start, end, bias.numel(), dtype=bias.dtype, device=bias.device)
+        bias.copy_(source_tensor.reshape(bias.shape))
     return bias
 
 def small_init_init_(weight: torch.Tensor, *, dim: int):
@@ -59,11 +60,6 @@ class LayerNorm(nn.LayerNorm):
 
 
 class MultiHeadLayerNorm(nn.Module):
-    """
-    Replicates the library's MultiHeadLayerNorm structure from ln.py,
-    which uses F.group_norm and a specific style for affine parameters.
-    The affine parameters (weight/bias) will be of size num_channels (NH*DH).
-    """
     def __init__(self, 
                  num_heads: int,       # NH
                  head_dim: int,        # DH
@@ -227,10 +223,8 @@ class LinearHeadwiseExpand(nn.Module):
 ################################################################################
 EPS = 1e-8 
 
-# In xlstm_replica.py
 
 def _prepare_ltr(S: int, device, dtype_bool: torch.dtype = torch.bool):
-    # Ensure it returns a boolean tensor as expected by torch.where
     return torch.tril(torch.ones((S, S), device=device, dtype=torch.float32)).to(dtype_bool)
 
 def parallel_stabilized_simple(
@@ -240,10 +234,10 @@ def parallel_stabilized_simple(
     igate_preact: torch.Tensor, # (B, NH, S, 1)
     fgate_preact: torch.Tensor, # (B, NH, S, 1)
     lower_triangular_matrix: Optional[torch.Tensor] = None, # (S, S) boolean
-    eps: float = EPS, # Ensure EPS is defined, e.g., EPS = 1e-6
+    eps: float = EPS, 
 ) -> torch.Tensor:
     """
-    Stabilised *batched* mLSTM kernel – MODIFIED to align with library and fix issues.
+   
 
     Shapes
     -------
@@ -623,135 +617,213 @@ class mLSTMBlock(nn.Module):
         return output_x, {"mlstm_layer_state": new_mlstm_core_state}
 
 ###############################################################################
-# sLSTM Components (adapted from user's code)                               #
+# sLSTM Components                          #
 ###############################################################################
+
+def powerlaw_blockdependent_init_(bias_tensor: torch.Tensor, head_dim: int, block_idx: int, num_blocks: int):
+    """
+    Initializes the bias tensor using the powerlaw block-dependent scheme.
+    The input bias_tensor is typically for one gate, shaped (num_heads, head_dim).
+    """
+    with torch.no_grad():
+        if num_blocks > 1:
+            ratio_0_to_1 = block_idx / (num_blocks - 1.0)
+        else:
+            ratio_0_to_1 = 0.0
+        
+        if head_dim == 1:
+            term_val = 0.0 
+        else:
+            term_val = (torch.arange(head_dim, device=bias_tensor.device, dtype=bias_tensor.dtype) / (head_dim - 1.0))
+            
+        exponent = 0.3 + 1.3 * ratio_0_to_1
+        init_values_raw = -(-5.0 + 12.0 * (term_val ** exponent))
+        
+        bias_tensor.copy_(init_values_raw.unsqueeze(0).expand_as(bias_tensor))
+    return bias_tensor
+
 @dataclass
 class sLSTMCellConfig:
-    embedding_dim: int
+    embedding_dim: int      
     num_heads: int = 4
-    bias: bool = False
+    bias: bool = True 
+    recurrent_bias: bool = False 
+    recurrent_transform_weight_init_std: Optional[float] = None 
+    _block_idx: int = 0
+    _num_blocks: int = 1
+
+    @property
+    def head_dim(self) -> int:
+        if self.embedding_dim % self.num_heads != 0:
+            raise ValueError(f"embedding_dim ({self.embedding_dim}) must be divisible by num_heads ({self.num_heads})")
+        return self.embedding_dim // self.num_heads
+
+    def __post_init__(self):
+        _ = self.head_dim
+
 
 class sLSTMCell(nn.Module):
     config_class = sLSTMCellConfig
     def __init__(self, cfg: sLSTMCellConfig):
         super().__init__()
         self.cfg = cfg
-        assert cfg.embedding_dim % cfg.num_heads == 0, "embedding_dim not divisible by num_heads"
-        self.head_dim = cfg.embedding_dim // cfg.num_heads
+        self.head_dim = cfg.head_dim
+        lhe_config_internal = LinearHeadwiseExpandConfig(
+            in_features=cfg.embedding_dim, 
+            num_heads=cfg.num_heads,
+            bias=cfg.recurrent_bias 
+        )
+        self.gate_transforms = nn.ModuleList([
+            LinearHeadwiseExpand(deepcopy(lhe_config_internal)) for _ in range(4) # z, i, f, o
+        ])
 
-        proj_cfg = LinearHeadwiseExpandConfig(cfg.embedding_dim, cfg.num_heads, bias=cfg.bias)
-        self.z_proj = LinearHeadwiseExpand(proj_cfg)
-        self.i_proj = LinearHeadwiseExpand(proj_cfg)
-        self.f_proj = LinearHeadwiseExpand(proj_cfg)
-        self.o_proj = LinearHeadwiseExpand(proj_cfg)
+        if cfg.bias: 
+            self.gate_biases = nn.Parameter(torch.empty(4, cfg.num_heads, self.head_dim))
+        else:
+            self.register_parameter('gate_biases', None)
+        
         self.reset_parameters()
 
     def reset_parameters(self):
-        for lin in (self.z_proj, self.i_proj, self.f_proj, self.o_proj):
-            lin.reset_parameters()
-        if self.cfg.bias and self.f_proj.linear.bias is not None: 
-            bias_linspace_init_(self.f_proj.linear.bias, start=3.0, end=6.0)
-        for proj in (self.z_proj, self.i_proj, self.o_proj):
-            if proj.linear.bias is not None: 
-                nn.init.zeros_(proj.linear.bias)
+        for i in range(4):
+            transform_layer = self.gate_transforms[i]
+            if self.cfg.recurrent_transform_weight_init_std is not None:
+                std = self.cfg.recurrent_transform_weight_init_std
+                if std == 0: 
+                    with torch.no_grad():
+                        transform_layer.weight.data.fill_(0.0)
+                elif std > 0: 
+                    with torch.no_grad():
+                        for h_idx in range(self.cfg.num_heads):
+                            transform_layer.weight.data[h_idx].normal_(mean=0.0, std=std)
+                
+                if self.cfg.recurrent_bias and transform_layer.bias is not None:
+                    nn.init.zeros_(transform_layer.bias.data)
+            else:
+                transform_layer.reset_parameters()
 
+        # Initialize final additive gate_biases
+        if self.cfg.bias and self.gate_biases is not None:
+            nn.init.zeros_(self.gate_biases[0, ...]) # z_bias
+            nn.init.zeros_(self.gate_biases[1, ...]) # i_bias
+            nn.init.zeros_(self.gate_biases[3, ...]) # o_bias
+            
+            powerlaw_blockdependent_init_(self.gate_biases[2, ...], 
+                                          self.head_dim, 
+                                          self.cfg._block_idx, 
+                                          self.cfg._num_blocks)
+    
     def _zeros_state(self, B: int, device, dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        h0 = torch.zeros(B, self.cfg.num_heads, self.head_dim, device=device, dtype=dtype)
+        state_shape = (B, self.cfg.num_heads, self.head_dim)
+        h0 = torch.zeros(state_shape, device=device, dtype=dtype)
         c0 = torch.zeros_like(h0)
-        n0 = torch.zeros_like(h0) 
-        m0 = torch.zeros_like(h0, dtype=torch.float32)  
+        n0 = torch.zeros_like(h0)
+        m0 = torch.zeros_like(h0, dtype=torch.float32) 
         return h0, c0, n0, m0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor: 
-        B, S, D_model = x.shape 
-        
-        # Projections result in (B, S, NH, DH)
-        z_all_proj = self.z_proj(x) 
-        i_all_proj = self.i_proj(x)
-        f_all_proj = self.f_proj(x)
-        o_all_proj = self.o_proj(x)
-
-        h, c, n_state, m_state = self._zeros_state(B, x.device, x.dtype)
-        outs = [] # List to store hidden states per timestep
-
-        for t in range(S):
-            z_t_proj = z_all_proj[:, t] 
-            i_t_proj = i_all_proj[:, t]
-            f_t_proj = f_all_proj[:, t]
-            o_t_proj = o_all_proj[:, t]
-
-            z_val = torch.tanh(z_t_proj)    
-            i_val = torch.exp(i_t_proj)    
-            f_val = torch.exp(f_t_proj)    
-            o_val = torch.sigmoid(o_t_proj) 
-
-            m_state_fp32 = m_state.to(torch.float32)
-            log_f_val_fp32 = torch.log(f_val).to(torch.float32) 
-            log_i_val_fp32 = torch.log(i_val).to(torch.float32)
-
-            m_new_fp32 = torch.maximum(log_f_val_fp32 + m_state_fp32, log_i_val_fp32)
-
-            i_hat = torch.exp(log_i_val_fp32.to(i_val.dtype) - m_new_fp32.to(i_val.dtype))
-            f_hat = torch.exp(log_f_val_fp32.to(f_val.dtype) + m_state_fp32.to(f_val.dtype) - m_new_fp32.to(f_val.dtype))
-            
-            c = f_hat * c + i_hat * z_val
-            n_state = f_hat * n_state + i_hat 
-            h = o_val * (c / (n_state + EPS)) 
-
-            outs.append(h)
-            m_state = m_new_fp32 
-
-        return torch.stack(outs, dim=1) 
-
-    def step(self, x_step: torch.Tensor, 
-               slstm_cell_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    def forward(self, x_gate_inputs: torch.Tensor, # (B, S, D_model * 4)
+                slstm_cell_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
                ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        B, S, D_quad_model = x_gate_inputs.shape
+        assert D_quad_model == self.cfg.embedding_dim * 4, "Input dimension mismatch"
+
+        projs_from_layer = torch.split(x_gate_inputs, self.cfg.embedding_dim, dim=-1)
         
-        B, S, _ = x_step.shape
-        assert S == 1, "sLSTMCell step method expects sequence length of 1"
+        transformed_signals_list = [
+            self.gate_transforms[i](projs_from_layer[i]) for i in range(4)
+        ]
         
-        z_t_proj = self.z_proj(x_step).squeeze(1)
-        i_t_proj = self.i_proj(x_step).squeeze(1)
-        f_t_proj = self.f_proj(x_step).squeeze(1)
-        o_t_proj = self.o_proj(x_step).squeeze(1)
+
+        z_transformed = transformed_signals_list[0].view(B, S, self.cfg.num_heads, self.head_dim)
+        i_transformed = transformed_signals_list[1].view(B, S, self.cfg.num_heads, self.head_dim)
+        f_transformed = transformed_signals_list[2].view(B, S, self.cfg.num_heads, self.head_dim)
+        o_transformed = transformed_signals_list[3].view(B, S, self.cfg.num_heads, self.head_dim)
 
         if slstm_cell_state is None:
-            h_prev, c_prev, n_prev, m_prev = self._zeros_state(B, x_step.device, x_step.dtype)
+            h_prev, c_prev, n_prev, m_prev = self._zeros_state(B, x_gate_inputs.device, x_gate_inputs.dtype)
         else:
             h_prev, c_prev, n_prev, m_prev = slstm_cell_state
             if m_prev.dtype != torch.float32: m_prev = m_prev.to(torch.float32)
-        
-        z_val = torch.tanh(z_t_proj)
-        i_val = torch.exp(i_t_proj)
-        f_val = torch.exp(f_t_proj)
-        o_val = torch.sigmoid(o_t_proj)
 
-        m_prev_fp32 = m_prev.to(torch.float32)
-        log_f_val_fp32 = torch.log(f_val).to(torch.float32)
-        log_i_val_fp32 = torch.log(i_val).to(torch.float32)
+        outs_h = [] 
 
-        m_new_fp32 = torch.maximum(log_f_val_fp32 + m_prev_fp32, log_i_val_fp32)
-        
-        i_hat = torch.exp(log_i_val_fp32.to(i_val.dtype) - m_new_fp32.to(i_val.dtype))
-        f_hat = torch.exp(log_f_val_fp32.to(f_val.dtype) + m_prev_fp32.to(f_val.dtype) - m_new_fp32.to(f_val.dtype))
+        for t in range(S):
+            z_t_curr = z_transformed[:, t, :, :]
+            i_t_curr = i_transformed[:, t, :, :]
+            f_t_curr = f_transformed[:, t, :, :]
+            o_t_curr = o_transformed[:, t, :, :]
 
-        c_new = f_hat * c_prev + i_hat * z_val
-        n_new = f_hat * n_prev + i_hat
-        h_new = o_val * (c_new / (n_new + EPS))
+            if self.cfg.bias and self.gate_biases is not None:
+                z_biased = z_t_curr + self.gate_biases[0].unsqueeze(0) 
+                i_biased = i_t_curr + self.gate_biases[1].unsqueeze(0)
+                f_biased = f_t_curr + self.gate_biases[2].unsqueeze(0)
+                o_biased = o_t_curr + self.gate_biases[3].unsqueeze(0)
+            else: 
+                z_biased = z_t_curr
+                i_biased = i_t_curr
+                f_biased = f_t_curr
+                o_biased = o_t_curr
+            
+            z_val = torch.tanh(z_biased)
+            i_val = torch.exp(i_biased) 
+            f_val = torch.exp(f_biased) 
+            o_val = torch.sigmoid(o_biased)
+
+            m_prev_fp32 = m_prev.to(torch.float32)
+            log_f_val_fp32 = torch.log(f_val.to(torch.float32) + EPS) 
+            log_i_val_fp32 = torch.log(i_val.to(torch.float32) + EPS)
+
+            m_new_fp32 = torch.maximum(log_f_val_fp32 + m_prev_fp32, log_i_val_fp32)
+
+
+            i_hat = torch.exp(log_i_val_fp32 - m_new_fp32).to(h_prev.dtype)
+            f_hat = torch.exp(log_f_val_fp32 + m_prev_fp32 - m_new_fp32).to(h_prev.dtype)
+            
+            c_new = f_hat * c_prev + i_hat * z_val
+            n_new = f_hat * n_prev + i_hat
+            h_new = o_val * (c_new / (n_new + EPS))
+
+            outs_h.append(h_new)
+            h_prev, c_prev, n_prev, m_prev = h_new, c_new, n_new, m_new_fp32
+
+        final_h_sequence = torch.stack(outs_h, dim=1) # (B, S, NH, DH)
+        final_state_tuple = (h_prev, c_prev, n_prev, m_prev)
         
-        return h_new.unsqueeze(1), (h_new, c_new, n_new, m_new_fp32)
+        return final_h_sequence, final_state_tuple
+
+    def step(self, x_gate_inputs_step: torch.Tensor, # (B, 1, D_model * 4)
+               slstm_cell_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+               ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+
+        h_sequence, final_state = self.forward(x_gate_inputs_step, slstm_cell_state=slstm_cell_state)
+        return h_sequence, final_state
 
 
 @dataclass
 class sLSTMLayerConfig:
-    embedding_dim: int 
+    embedding_dim: int
     context_length: int 
-    num_heads: int = 4  
+    num_heads: int = 4
     conv1d_kernel_size: int = 0 
     bias: bool = False 
     dropout: float = 0.0
-    group_norm_weight: bool = True 
-    _num_blocks: int = 1 
+    group_norm_weight: bool = True
+    
+    cell_final_bias: bool = True          
+    cell_recurrent_transform_bias: bool = False 
+    cell_recurrent_transform_weight_init_std: Optional[float] = None 
+
+    _block_idx: int = 0
+    _num_blocks: int = 1
+
+    @property
+    def head_dim(self) -> int: 
+        if self.embedding_dim % self.num_heads != 0:
+            raise ValueError(f"embedding_dim ({self.embedding_dim}) must be divisible by num_heads ({self.num_heads})")
+        return self.embedding_dim // self.num_heads
+
+    def __post_init__(self):
+        _ = self.head_dim 
 
 class sLSTMLayer(nn.Module):
     config_class = sLSTMLayerConfig
@@ -759,11 +831,10 @@ class sLSTMLayer(nn.Module):
         super().__init__()
         self.cfg = cfg
         
-        # Optional Causal Convolution
         if cfg.conv1d_kernel_size > 0:
             self.conv1d = CausalConv1d(CausalConv1dConfig(
-                feature_dim=cfg.embedding_dim, # Conv operates on layer's embedding_dim
-                kernel_size=cfg.conv1d_kernel_size, 
+                feature_dim=cfg.embedding_dim,
+                kernel_size=cfg.conv1d_kernel_size,
                 bias=cfg.bias
             ))
             self.conv_act = nn.SiLU()
@@ -771,24 +842,35 @@ class sLSTMLayer(nn.Module):
             self.conv1d = None
             self.conv_act = None
 
-        # sLSTM Cell
-        # The cell's embedding_dim is the same as the layer's input/output embedding_dim
-        cell_cfg = sLSTMCellConfig(
-            embedding_dim=cfg.embedding_dim, 
+        proj_cfg = LinearHeadwiseExpandConfig(
+            in_features=cfg.embedding_dim, 
             num_heads=cfg.num_heads, 
-            bias=cfg.bias
+            bias=cfg.bias 
         )
-        self.cell = sLSTMCell(cell_cfg)
+        self.z_gate_proj = LinearHeadwiseExpand(deepcopy(proj_cfg))
+        self.i_gate_proj = LinearHeadwiseExpand(deepcopy(proj_cfg))
+        self.f_gate_proj = LinearHeadwiseExpand(deepcopy(proj_cfg))
+        self.o_gate_proj = LinearHeadwiseExpand(deepcopy(proj_cfg))
+
+        
+        cell_cfg_obj = sLSTMCellConfig(
+            embedding_dim=cfg.embedding_dim,
+            num_heads=cfg.num_heads,
+            bias=cfg.cell_final_bias, 
+            recurrent_bias=cfg.cell_recurrent_transform_bias,
+            recurrent_transform_weight_init_std=cfg.cell_recurrent_transform_weight_init_std,
+            _block_idx=cfg._block_idx,
+            _num_blocks=cfg._num_blocks
+        )
+        self.cell = sLSTMCell(cell_cfg_obj)
         
         self.dropout_layer = nn.Dropout(cfg.dropout)
         
-        # Group Normalization
-        # Head dim for norm is layer_embedding_dim / num_heads
         head_dim_for_norm = cfg.embedding_dim // cfg.num_heads
         self.group_norm = MultiHeadLayerNorm(
-            num_heads=cfg.num_heads, 
-            head_dim=head_dim_for_norm, 
-            weight=cfg.group_norm_weight, 
+            num_heads=cfg.num_heads,
+            head_dim=head_dim_for_norm,
+            weight=cfg.group_norm_weight,
             bias=False 
         )
         self.reset_parameters()
@@ -796,59 +878,163 @@ class sLSTMLayer(nn.Module):
     def reset_parameters(self):
         if self.conv1d is not None:
             self.conv1d.reset_parameters()
+
+        self.z_gate_proj.reset_parameters()
+        self.i_gate_proj.reset_parameters()
+        self.f_gate_proj.reset_parameters()
+        self.o_gate_proj.reset_parameters()
+        
         self.cell.reset_parameters()
         self.group_norm.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor: # x: (B, S, D_layer_embed)
+    def forward(self, x: torch.Tensor, 
+                slstm_cell_state_init: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+               ) -> torch.Tensor: 
+        B, S, D_embed = x.shape
+
         if self.conv1d is not None and self.conv_act is not None:
             x_conv = self.conv1d(x)
-            x_processed = self.conv_act(x_conv)
+            x_conv_activated = self.conv_act(x_conv)
         else:
-            x_processed = x
+            x_conv_activated = x 
+
+        # Projections from this layer: i, f from x_conv_activated; z, o from x
+        i_projected = self.i_gate_proj(x_conv_activated)
+        f_projected = self.f_gate_proj(x_conv_activated)
+        z_projected = self.z_gate_proj(x)
+        o_projected = self.o_gate_proj(x)
+
+        # Concatenate gate inputs for the cell: (B, S, D_model * 4)
+        # Order is z, i, f, o, which sLSTMCell expects for its gate_transforms and gate_biases
+        gate_inputs_concat = torch.cat([z_projected, i_projected, f_projected, o_projected], dim=-1)
         
-        h_cell = self.cell(x_processed) 
+        # Cell processes concatenated inputs. Output h_cell_output is (B, S, NH, DH)
+        h_cell_output, _ = self.cell(gate_inputs_concat, slstm_cell_state=slstm_cell_state_init)
         
-        h_dropped = self.dropout_layer(h_cell) # (B, S, NH, DH_cell)
+        h_dropped = self.dropout_layer(h_cell_output) # Still (B, S, NH, DH)
         
-        # Group norm expects (B, NH, S, DH_cell)
+        # Group norm expects (B, NH, S, DH)
         h_norm_input = h_dropped.transpose(1, 2) 
-        h_norm_output = self.group_norm(h_norm_input) # (B, NH, S, DH_cell)
+        h_norm_output = self.group_norm(h_norm_input) 
         
         # Transpose back and reshape to (B, S, D_layer_embed)
         h_final = h_norm_output.transpose(1, 2).contiguous()
-        return h_final.view(x.size(0), x.size(1), -1)
+        return h_final.view(B, S, D_embed)
 
-    def step(self, x_step: torch.Tensor, 
+    def step(self, x_step: torch.Tensor, # (B, 1, D_layer_embed)
                slstm_cell_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
               ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        # x_step: (B, 1, D_layer_embed)
+        B, S_one, D_embed = x_step.shape
+        assert S_one == 1, "Step method expects sequence length of 1"
+
         if self.conv1d is not None and self.conv_act is not None:
-            x_conv_step = self.conv1d(x_step) # CausalConv1d handles (B,1,D) correctly
-            x_processed_step = self.conv_act(x_conv_step)
+            x_conv_step = self.conv1d(x_step) 
+            x_conv_activated_step = self.conv_act(x_conv_step)
         else:
-            x_processed_step = x_step
+            x_conv_activated_step = x_step
+
+        i_projected_step = self.i_gate_proj(x_conv_activated_step)
+        f_projected_step = self.f_gate_proj(x_conv_activated_step)
+        z_projected_step = self.z_gate_proj(x_step)
+        o_projected_step = self.o_gate_proj(x_step)
+
+        gate_inputs_concat_step = torch.cat([z_projected_step, i_projected_step, f_projected_step, o_projected_step], dim=-1)
         
-        # cell input x_processed_step is (B, 1, D_layer_embed)
-        # cell output h_cell_step is (B, 1, NH, DH_cell)
-        # new_slstm_cell_state is (h, c, n, m) where h is (B,NH,DH)
-        h_cell_step, new_slstm_cell_state_tuple = self.cell.step(x_processed_step, slstm_cell_state=slstm_cell_state)
+        h_cell_step_output, new_slstm_cell_state_tuple = self.cell.step(
+            gate_inputs_concat_step, slstm_cell_state=slstm_cell_state
+        )
         
-        h_dropped_step = self.dropout_layer(h_cell_step) # (B, 1, NH, DH_cell)
+        h_dropped_step = self.dropout_layer(h_cell_step_output) # (B, 1, NH, DH)
         
-        # Group norm expects (B, NH, S, DH_cell) -> (B, NH, 1, DH_cell)
-        h_norm_input_step = h_dropped_step.transpose(1, 2)
-        h_norm_output_step = self.group_norm(h_norm_input_step) # (B, NH, 1, DH_cell)
+        h_norm_input_step = h_dropped_step.transpose(1, 2) # (B, NH, 1, DH)
+        h_norm_output_step = self.group_norm(h_norm_input_step) # (B, NH, 1, DH)
         
-        # Transpose back and reshape to (B, 1, D_layer_embed)
         h_final_step = h_norm_output_step.transpose(1, 2).contiguous()
-        output_step = h_final_step.view(x_step.size(0), 1, -1)
+        output_step = h_final_step.view(B, S_one, D_embed) # (B, 1, D_embed)
         
         return output_step, new_slstm_cell_state_tuple
 
+
+@dataclass
+class sLSTMBlockConfig:
+    slstm_layer_config: sLSTMLayerConfig 
+    feedforward_config: Optional[FeedForwardConfig] = None
+    _block_idx: int = 0 
+    _num_blocks: int = 1 
+
+    def __post_init__(self):
+        if self.slstm_layer_config is not None:
+            self.slstm_layer_config._block_idx = self._block_idx
+            self.slstm_layer_config._num_blocks = self._num_blocks
+
+class sLSTMBlock(nn.Module):
+    config_class = sLSTMBlockConfig
+    def __init__(self, config: sLSTMBlockConfig):
+        super().__init__()
+        self.config = config
+        
+        block_embedding_dim = config.slstm_layer_config.embedding_dim
+        
+        self.ln1 = LayerNorm(block_embedding_dim, weight=True, bias=False) 
+        self.core = sLSTMLayer(config.slstm_layer_config) 
+        
+        if config.feedforward_config is not None:
+            self.ln2 = LayerNorm(block_embedding_dim, weight=True, bias=False) 
+            self.ffn = FeedForward(config.feedforward_config, embedding_dim=block_embedding_dim)
+        else:
+            self.ln2 = None
+            self.ffn = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.ln1.reset_parameters()
+        self.core.reset_parameters()
+        if self.ffn is not None and self.ln2 is not None:
+            self.ln2.reset_parameters()
+            self.ffn.reset_parameters()
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        identity = x
+        x = self.ln1(x)
+        x = self.core(x) # sLSTMLayer.forward
+        x = identity + x
+        
+        if self.ffn is not None and self.ln2 is not None:
+            identity_ffn = x
+            x = self.ln2(x)
+            x = self.ffn(x)
+            x = identity_ffn + x
+        return x
+
+    def step(self, x_step: torch.Tensor, state: Optional[Dict[str, Tuple]] = None, **kwargs):
+        # state is expected to be like {"slstm_layer_state": (h,c,n,m)} or None
+        # where (h,c,n,m) is the tuple for sLSTMCell's state.
+        slstm_core_state_val = state.get("slstm_layer_state") if state else None
+        
+        identity_step = x_step
+        x_ln1_step = self.ln1(x_step)
+        
+        core_out_step, new_slstm_core_state_tuple = self.core.step(
+            x_ln1_step, slstm_cell_state=slstm_core_state_val
+        )
+        res_x_step = identity_step + core_out_step
+
+        if self.ffn is not None and self.ln2 is not None:
+            identity_ffn_step = res_x_step
+            x_ln2_step = self.ln2(res_x_step)
+            ffn_out_step = self.ffn(x_ln2_step) 
+            final_x_step = identity_ffn_step + ffn_out_step
+        else:
+            final_x_step = res_x_step
+            
+        # The new state dict should match the expected input format for the next step
+        new_state_dict = {"slstm_layer_state": new_slstm_core_state_tuple}
+        return final_x_step, new_state_dict
+
 @dataclass
 class FeedForwardConfig:
-    proj_factor: float = 1.0 # Factor to determine inner dim: inner_dim = proj_factor * embedding_dim
-    act_fn: str = "gelu"    # Activation function name (e.g., "gelu", "silu")
+    proj_factor: float = 1.0 
+    act_fn: str = "gelu"    # Activation function name 
     dropout: float = 0.0
     bias: bool = False      # Bias for linear layers
 
@@ -884,65 +1070,7 @@ class FeedForward(nn.Module):
         x = self.fc2(x)
         return self.dropout_layer(x)
 
-@dataclass
-class sLSTMBlockConfig:
-    slstm_layer_config: sLSTMLayerConfig 
-    feedforward_config: Optional[FeedForwardConfig] = None # Optional FFN
-    # _block_idx can be added if adaptive initialization per block is needed later
-    # _num_blocks can be added if specific initializations inside block depend on total number
 
-class sLSTMBlock(nn.Module):
-    config_class = sLSTMBlockConfig
-    def __init__(self, config: sLSTMBlockConfig):
-        super().__init__()
-        self.config = config
-        
-        block_embedding_dim = config.slstm_layer_config.embedding_dim
-        
-        self.ln1 = LayerNorm(block_embedding_dim, weight=True, bias=False)
-        self.core = sLSTMLayer(config.slstm_layer_config)
-        
-        if config.feedforward_config is not None:
-            self.ln2 = LayerNorm(block_embedding_dim, weight=True, bias=False)
-            self.ffn = FeedForward(config.feedforward_config, embedding_dim=block_embedding_dim)
-        else:
-            self.ln2 = None
-            self.ffn = None
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.ln1.reset_parameters()
-        self.core.reset_parameters()
-        if self.ffn is not None:
-            assert self.ln2 is not None
-            self.ln2.reset_parameters()
-            self.ffn.reset_parameters()
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor: # Added **kwargs for compatibility
-        # Residual connection for the sLSTM core part
-        x = x + self.core(self.ln1(x))
-        
-        # Optional FFN part with its own residual connection
-        if self.ffn is not None:
-            assert self.ln2 is not None
-            x = x + self.ffn(self.ln2(x))
-        return x
-
-    def step(self, x_step: torch.Tensor, state: Optional[Dict[str, Tuple]] = None, **kwargs):
-        # state is expected to be like {"slstm_layer_state": (h,c,n,m)} or None
-        slstm_layer_state_val = state.get("slstm_layer_state") if state else None
-        
-        core_out_step, new_slstm_core_state = self.core.step(self.ln1(x_step), slstm_cell_state=slstm_layer_state_val)
-        res_x_step = x_step + core_out_step
-
-        if self.ffn is not None:
-            assert self.ln2 is not None
-            ffn_out_step = self.ffn(self.ln2(res_x_step))
-            final_x_step = res_x_step + ffn_out_step
-        else:
-            final_x_step = res_x_step
-            
-        return final_x_step, {"slstm_layer_state": new_slstm_core_state}
 
 
 ################################################################################
@@ -1014,14 +1142,11 @@ class xLSTMBlockStackConfig:
             raise ValueError("At least one of 'mlstm_block_template' or 'slstm_block_template' must be provided.")
 
         # Determine default if slstm_at is empty and both templates are available
-        if not self.slstm_at and isinstance(self.slstm_at, list): # Empty list
+        if not self.slstm_at and isinstance(self.slstm_at, list): 
             if self.mlstm_block_template is not None and self.slstm_block_template is None:
-                self.slstm_at = "none" # Default to all mLSTM if only mLSTM template given
+                self.slstm_at = "none"
             elif self.mlstm_block_template is None and self.slstm_block_template is not None:
-                self.slstm_at = "all" # Default to all sLSTM if only sLSTM template given
-            # If both are available and slstm_at is empty list, it means all mLSTM by default (block_map_list default)
-
-        # Propagate shared parameters to the mLSTM block template's layer config
+                self.slstm_at = "all" 
         if self.mlstm_block_template is not None:
             layer_cfg = self.mlstm_block_template.mlstm_layer_config
             layer_cfg.embedding_dim = self.embedding_dim
@@ -1029,23 +1154,17 @@ class xLSTMBlockStackConfig:
             layer_cfg.bias = self.bias
             layer_cfg.dropout = self.dropout
             layer_cfg._num_blocks = self.num_blocks 
-            # mLSTMLayerConfig does not have __post_init__ in user's code
-
-        # Propagate shared parameters to the sLSTM block template's layer config
         if self.slstm_block_template is not None:
             layer_cfg = self.slstm_block_template.slstm_layer_config
             layer_cfg.embedding_dim = self.embedding_dim
-            layer_cfg.context_length = self.context_length # sLSTMLayerConfig has context_length
+            layer_cfg.context_length = self.context_length 
             layer_cfg.bias = self.bias
             layer_cfg.dropout = self.dropout
             layer_cfg._num_blocks = self.num_blocks
-            # sLSTMLayerConfig does not have __post_init__ in user's code
-            
-            # Also propagate to FFN config if it exists within sLSTM template
             if self.slstm_block_template.feedforward_config is not None:
                 ffn_cfg = self.slstm_block_template.feedforward_config
-                ffn_cfg.dropout = self.dropout # FFN dropout might be different, but here tied to global
-                ffn_cfg.bias = self.bias       # FFN bias
+                ffn_cfg.dropout = self.dropout 
+                ffn_cfg.bias = self.bias       
 
         self._block_map_str = self._create_block_map_str()
 
@@ -1071,8 +1190,7 @@ class xLSTMBlockStack(nn.Module):
             if block_type_int == 0: # mLSTMBlock
                 if self.config.mlstm_block_template is None:
                     raise RuntimeError("Trying to create mLSTMBlock but mlstm_block_template is None.")
-                # Deepcopy the template config to allow for per-block modifications if ever needed
-                # (e.g., _block_idx for adaptive init, though not used here)
+
                 block_cfg = deepcopy(self.config.mlstm_block_template)
                 module_blocks.append(mLSTMBlock(config=block_cfg))
             elif block_type_int == 1: # sLSTMBlock
@@ -1087,12 +1205,12 @@ class xLSTMBlockStack(nn.Module):
     def reset_parameters(self) -> None:
         for block in self.blocks:
             block.reset_parameters()
-        if isinstance(self.post_blocks_norm, LayerNorm): # Check before calling
+        if isinstance(self.post_blocks_norm, LayerNorm):
             self.post_blocks_norm.reset_parameters()
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, **kwargs) # Pass kwargs to each block's forward
+            x = block(x, **kwargs) 
         x = self.post_blocks_norm(x)
         return x
 

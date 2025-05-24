@@ -226,3 +226,120 @@ class LSTMModel_NNS(nn.Module):
         h_inp = self.inp(x)
         h_lstm, _ = self.lstm(h_inp)
         return self.out(h_lstm[:,-1]).squeeze(-1) 
+    
+
+    # the lstm trasnformers hypered models 
+
+
+    # ──────────────────────────────────────────────────────────────────────────────
+# HYBRID LSTM ↔ TRANSFORMER  CORE  (xLSTM-style configurable block stack)
+# ──────────────────────────────────────────────────────────────────────────────
+from dataclasses import dataclass
+from typing import List, Union
+
+@dataclass
+class LSTMBlockCfg:
+    hidden_dim: int
+    dropout: float = 0.1           
+    bidirectional: bool = False    
+
+@dataclass
+class TransformerBlockCfg:
+    hidden_dim: int
+    n_heads: int
+    dropout: float = 0.1
+
+@dataclass
+class HybridStackCfg:
+    """Order of `blocks` defines the stack layout (e.g. [L,T,L])."""
+    blocks: List[Union[LSTMBlockCfg, TransformerBlockCfg]]
+    input_dim: int                 
+    max_len: int = 512             
+
+class _HybridLSTMBlock(nn.Module):
+    def __init__(self, cfg: LSTMBlockCfg):
+        super().__init__()
+        self.lstm = nn.LSTM(cfg.hidden_dim,
+                            cfg.hidden_dim,
+                            num_layers=1,
+                            batch_first=True,
+                            dropout=cfg.dropout,
+                            bidirectional=cfg.bidirectional)
+        self.norm = nn.LayerNorm(cfg.hidden_dim)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x, hidden=None):
+        out, h = self.lstm(x, hidden)
+        return self.dropout(self.norm(out)), h
+
+class _HybridTransformerBlock(nn.Module):
+    def __init__(self, cfg: TransformerBlockCfg, max_len: int):
+        super().__init__()
+        self.pos = PositionalEncoding(cfg.hidden_dim, max_len, dropout=cfg.dropout)
+        layer = nn.TransformerEncoderLayer(d_model=cfg.hidden_dim,
+                                           nhead=cfg.n_heads,
+                                           dim_feedforward=cfg.hidden_dim * 4,
+                                           dropout=cfg.dropout,
+                                           activation="gelu",
+                                           batch_first=True)
+        self.enc = nn.TransformerEncoder(layer, num_layers=1)
+        self.norm = nn.LayerNorm(cfg.hidden_dim)
+
+    def forward(self, x, *_):
+        seq_len = x.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len,
+                                     device=x.device) * float("-inf"), 1)
+        h = self.pos(x)
+        h = self.enc(h, mask=mask, is_causal=True)
+        return self.norm(h), None   
+
+class HybridStackCoreLM(nn.Module):
+    """
+    xLSTM-inspired stack: an ordered list of blocks where each block
+    is *either* an LSTM or a Transformer.
+    """
+    def __init__(self, cfg: HybridStackCfg):
+        super().__init__()
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.blocks[0].hidden_dim)
+        self.blocks = nn.ModuleList()
+        for blk_cfg in cfg.blocks:
+            if isinstance(blk_cfg, LSTMBlockCfg):
+                self.blocks.append(_HybridLSTMBlock(blk_cfg))
+            elif isinstance(blk_cfg, TransformerBlockCfg):
+                self.blocks.append(_HybridTransformerBlock(blk_cfg, cfg.max_len))
+            else:
+                raise ValueError(f"Unknown block cfg {type(blk_cfg)}")
+        self.out_dim = cfg.blocks[0].hidden_dim  
+
+    def forward(self, x: torch.Tensor, hidden=None):
+        h = self.proj_in(x)
+        next_hidden = []
+        for blk in self.blocks:
+            h, h_blk = blk(h, None)
+            next_hidden.append(h_blk)
+        return h, next_hidden  
+
+def build_hybrid_core_lm(input_dim: int,
+                         hidden_dim: int,
+                         pattern: str = "LT",
+                         n_heads: int = 4,
+                         dropout: float = 0.1,
+                         max_len: int = 512) -> HybridStackCoreLM:
+    """
+    pattern: string with 'L' (LSTM) and 'T' (Transformer) – e.g. "LLTT" or "TL".
+    """
+    blocks = []
+    for ch in pattern.upper():
+        if ch == "L":
+            blocks.append(LSTMBlockCfg(hidden_dim=hidden_dim,
+                                       dropout=dropout))
+        elif ch == "T":
+            blocks.append(TransformerBlockCfg(hidden_dim=hidden_dim,
+                                              n_heads=n_heads,
+                                              dropout=dropout))
+        else:
+            raise ValueError(f"Unsupported char {ch} in pattern; use L/T.")
+    stack_cfg = HybridStackCfg(blocks=blocks,
+                               input_dim=input_dim,
+                               max_len=max_len)
+    return HybridStackCoreLM(stack_cfg)
