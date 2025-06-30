@@ -3,7 +3,7 @@ import torch, math, copy
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-import xlstm_replica as xlstm_scratch
+import xlstm_replica_old as xlstm_scratch
 from xlstm import (
     xLSTMBlockStack as LibXLSTMBlockStack,
     xLSTMBlockStackConfig as LibXLSTMBlockStackConfig,
@@ -16,6 +16,8 @@ from xlstm import (
 from utils.training_loops import make_lm_scheduler         
 from utils.plotting import plot_nns_results as plot_results 
 from utils.model_architectures import build_hybrid_core_lm, SimpleLMWrapper
+from utils.model_architectures import GeneralHybridLM,GeneralHybridConfig # Or wherever you stored it
+
 # ─── MQAR hyper-params ─────────────────────────────────────────────────────────
 VOCAB_SIZE     = 256      
 SEQ_LEN        = 64        
@@ -28,7 +30,7 @@ LR_FINAL       = 1e-7
 DROPOUT        = 0.10
 WEIGHT_DECAY   = 0.01
 GRAD_CLIP_NORM = 1.0
-PATIENCE       = 8          
+PATIENCE       = 5          
 
 # ─── Dataset ───────────────────────────────────────────────────────────────────
 class MQARDataset(Dataset):
@@ -114,7 +116,6 @@ class _LibXLSTM(nn.Module):
         h = self.body(h)
         return self.proj(h)
 
-# ── put this near the top of mqar_benchmark.py, alongside _LibXLSTM ──────────
 class _LibXLSTM_Mixed(nn.Module):
     """
     Library xLSTM with 4 blocks, alternating sLSTM ↔ mLSTM, all sharing
@@ -138,7 +139,6 @@ class _LibXLSTM_Mixed(nn.Module):
                 dropout=DROPOUT)
         )
 
-        # ── mLSTM block template (same dim, same dropout) ───────────────────
 
         m_cfg = LibmLSTMBlockConfig(
             LibmLSTMLayerConfig(               
@@ -155,13 +155,11 @@ class _LibXLSTM_Mixed(nn.Module):
         stack_cfg = LibXLSTMBlockStackConfig(
             slstm_block=s_cfg,
             mlstm_block=m_cfg,
-            num_blocks=4,              # S M S M  (even ↔ odd)
+            num_blocks=4,              # S M S M  
             context_length=SEQ_LEN,
             embedding_dim=EMBED_DIM,
             dropout=DROPOUT,
             add_post_blocks_norm=True,
-            slstm_at="even",
-            mlstm_at="odd"
         )
         self.body = LibXLSTMBlockStack(stack_cfg)
         self.proj = nn.Linear(EMBED_DIM, VOCAB_SIZE)
@@ -202,7 +200,6 @@ def run_mqar_benchmark(device_str="cpu",
     val_loader   = DataLoader(val_ds,  BATCH_SIZE)
 
 
-    # Choose models
     if benchmark_type == "xlstm_vs_lib":
         
         models = {#"lstm_trans_hypered"   : lstm_trans_hypered,
@@ -213,7 +210,7 @@ def run_mqar_benchmark(device_str="cpu",
         hybrid_core = build_hybrid_core_lm(
             input_dim=EMBED_DIM,
             hidden_dim=EMBED_DIM,
-            pattern="TLTL",      # 4 blocks, alternates like the xLSTM stack
+            pattern="TLTL",      
             n_heads=4,
             dropout=DROPOUT,
             max_len=SEQ_LEN
@@ -229,6 +226,69 @@ def run_mqar_benchmark(device_str="cpu",
             "Hybrid-TLTL": hybrid_model,
             "xLSTM-Mixed": _LibXLSTM_Mixed()
         }
+    elif benchmark_type == "general_hybrid_mqar":
+        cfg_TLTL = GeneralHybridConfig(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM, 
+                block_string="TLTL",
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+        )
+        cfg_msms = GeneralHybridConfig(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM, 
+                block_string="msms",
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+        )
+        models = {
+            "General-S (MQAR)": GeneralHybridLM(cfg_TLTL),
+            "General-SM (MQAR)": GeneralHybridLM(cfg_msms),
+            "xLSTM-Lib": _LibXLSTM_Mixed()
+        }
+    elif benchmark_type == "sm_combinations":
+        models = {}
+        sm_combinations = [
+            'SSSS', 'SSSM', 'SSMS', 'SMSS', 'MSSS', 'SSMM', 'SMSM', 'SMMS', 
+            'MSMS', 'MSSM', 'MMSS', 'SMMM', 'MSMM', 'MMSM', 'MMMS', 'MMMM'
+        ]
+        for combo in sm_combinations:
+            cfg = GeneralHybridConfig(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM, 
+                block_string=combo,
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (MQAR)"] = GeneralHybridLM(cfg)
+
+    elif benchmark_type == "lt_combinations":
+        models = {}
+        lt_combinations = [
+            'LLLL', 'LLLT', 'LLTL', 'LTLL', 'TLLL', 'LLTT', 'LTLT', 'LTTL', 
+            'TLTL', 'TLLT', 'TTLL', 'LTTT', 'TLTT', 'TTLT', 'TTTL', 'TTTT'
+        ]
+        for combo in lt_combinations:
+            cfg = GeneralHybridConfig(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM, 
+                block_string=combo,
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (MQAR)"] = GeneralHybridLM(cfg)
     else:
         raise ValueError(f"Unknown type {benchmark_type}")
 

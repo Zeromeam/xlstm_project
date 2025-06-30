@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import xlstm_replica as xlstm_scratch 
+import xlstm_replica_old as xlstm_scratch 
 from xlstm import (
     xLSTMBlockStack as LibXLSTMBlockStack,
     xLSTMBlockStackConfig as LibXLSTMBlockStackConfig,
@@ -18,6 +18,7 @@ from utils.training_loops import make_lm_scheduler # Reusing the LM scheduler lo
 from typing import Dict, Optional 
 import copy
 import math 
+from utils.model_architectures import build_hybrid_core_lm
 
 # NNS Specific Hyperparameters
 NNS_MAX_LEN = 64

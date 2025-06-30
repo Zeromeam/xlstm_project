@@ -2,8 +2,14 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Dict,Optional
-
+from typing import Dict,Optional,Tuple
+# -------------------------------------------------------------------
+from xlstm import (
+    xLSTMBlockStack, xLSTMBlockStackConfig,
+    mLSTMBlockConfig, mLSTMLayerConfig,
+    sLSTMBlockConfig, sLSTMLayerConfig,
+    FeedForwardConfig,
+)
 # --- Common Model Wrapper ---
 class SimpleLMWrapper(nn.Module):
     """Wrap core stack with token embedding & untied LM head."""
@@ -273,25 +279,35 @@ class _HybridLSTMBlock(nn.Module):
         return self.dropout(self.norm(out)), h
 
 class _HybridTransformerBlock(nn.Module):
+    """
+    This block is correct. It is designed to be self-contained
+    and applies its own positional encoding, which is the proper
+    design for a modular Transformer block.
+    """
     def __init__(self, cfg: TransformerBlockCfg, max_len: int):
         super().__init__()
         self.pos = PositionalEncoding(cfg.hidden_dim, max_len, dropout=cfg.dropout)
-        layer = nn.TransformerEncoderLayer(d_model=cfg.hidden_dim,
-                                           nhead=cfg.n_heads,
-                                           dim_feedforward=cfg.hidden_dim * 4,
-                                           dropout=cfg.dropout,
-                                           activation="gelu",
-                                           batch_first=True)
+        layer = nn.TransformerEncoderLayer(
+            d_model=cfg.hidden_dim,
+            nhead=cfg.n_heads,
+            dim_feedforward=cfg.hidden_dim * 4,
+            dropout=cfg.dropout,
+            activation="gelu",
+            batch_first=True
+        )
         self.enc = nn.TransformerEncoder(layer, num_layers=1)
         self.norm = nn.LayerNorm(cfg.hidden_dim)
 
     def forward(self, x, *_):
         seq_len = x.size(1)
-        mask = torch.triu(torch.ones(seq_len, seq_len,
-                                     device=x.device) * float("-inf"), 1)
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device) * float('-inf'), diagonal=1)
+        
+        # Applies its own positional encoding to the input it receives.
         h = self.pos(x)
         h = self.enc(h, mask=mask, is_causal=True)
-        return self.norm(h), None   
+        
+        return self.norm(h), None
+ 
 
 class HybridStackCoreLM(nn.Module):
     """
@@ -343,3 +359,127 @@ def build_hybrid_core_lm(input_dim: int,
                                input_dim=input_dim,
                                max_len=max_len)
     return HybridStackCoreLM(stack_cfg)
+
+
+
+#####
+
+
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class GeneralHybridConfig:
+    vocab_size: int
+    embed_dim: int
+    hidden_dim: int
+    block_string: str         
+    context_length: int
+    n_heads: int = 4          
+    dropout: float = 0.1
+    pad_idx: int = 0
+    def __post_init__(self):
+        allowed = set("tlms")
+        if not set(self.block_string.lower()) <= allowed:
+            raise ValueError(f"Unknown symbols in block_string: {self.block_string}")
+        self.blocks: List[str] = list(self.block_string.lower())
+
+
+
+
+class GeneralHybridLM(nn.Module):
+    def __init__(self, cfg: GeneralHybridConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.embed_dim, padding_idx=cfg.pad_idx)
+        
+        # --- ADDED: The critical input projection layer. ---
+        # It maps the embedding dimension to the model's hidden dimension.
+        self.proj_in = nn.Linear(cfg.embed_dim, cfg.hidden_dim)
+
+        self.dropout = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([self._make_block(sym) for sym in cfg.blocks])
+
+        # --- REMOVED: Final LayerNorm. The successful model does not have this. ---
+        # self.norm = nn.LayerNorm(cfg.hidden_dim) 
+        
+        self.lm_head = nn.Linear(cfg.hidden_dim, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight  # weight tying
+        self.apply(self._init_weights)
+
+    def _make_block(self, sym: str) -> nn.Module:
+        cfg = self.cfg
+        d = self.cfg.hidden_dim
+        if sym == 'l':
+            lstm_block_cfg = LSTMBlockCfg(hidden_dim=d, dropout=cfg.dropout)
+            return _HybridLSTMBlock(lstm_block_cfg)
+        if sym == 't':
+            transformer_block_cfg = TransformerBlockCfg(hidden_dim=d, n_heads=cfg.n_heads, dropout=cfg.dropout)
+            return _HybridTransformerBlock(transformer_block_cfg, max_len=cfg.context_length)
+        if sym == 'm':
+            mlstm_cfg = mLSTMBlockConfig(
+                mlstm=mLSTMLayerConfig(
+                    conv1d_kernel_size=4,
+                    qkv_proj_blocksize=4,
+                    num_heads=self.cfg.n_heads,
+                )
+            )
+            stack = xLSTMBlockStack(
+                xLSTMBlockStackConfig(
+                    mlstm_block=mlstm_cfg,
+                    context_length=self.cfg.context_length,
+                    num_blocks=1,
+                    embedding_dim=d,
+                )
+            )
+            return XLSTMWrapper(stack)
+        if sym == 's':
+            slstm_cfg = sLSTMBlockConfig(
+                slstm=sLSTMLayerConfig(
+                    backend="vanilla" ,
+                    conv1d_kernel_size=4,
+                    num_heads=self.cfg.n_heads,
+                    bias_init="powerlaw_blockdependent",
+                ),
+                feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
+            )
+            stack = xLSTMBlockStack(
+                xLSTMBlockStackConfig(
+                    slstm_block=slstm_cfg,
+                    context_length=self.cfg.context_length,
+                    num_blocks=1,
+                    embedding_dim=d,
+                )
+            )
+            return XLSTMWrapper(stack)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if getattr(m, "bias", None) is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, hidden=None):
+        x = self.embed(idx)
+        
+        # --- Apply the projection and dropout ---
+        x = self.proj_in(x)
+        x = self.dropout(x)
+        
+        for blk in self.blocks:
+            x, hidden = blk(x, hidden)
+            
+        # --- The final LayerNorm is no longer here ---
+        # x = self.norm(x)
+        
+        return self.lm_head(x), hidden
+
+
+
+class XLSTMWrapper(nn.Module):
+    def __init__(self, stack: nn.Module):
+        super().__init__()
+        self.stack = stack
+    def forward(self, x, hidden=None):
+        x_out = self.stack(x)
+        return x_out, None

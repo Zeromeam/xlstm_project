@@ -41,132 +41,158 @@ def make_lm_scheduler(optimizer: optim.Optimizer, total_steps: int,
     return optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
 
-def train_one_lm_model(model_name: str, model: nn.Module, 
-                       train_data: torch.Tensor, val_data: torch.Tensor, 
+def train_one_lm_model(model_name: str, model: nn.Module,
+                       train_data: torch.Tensor, val_data: torch.Tensor,
                        cfg: Dict, pad_idx: int, device: str):
     bptt = cfg["bptt"]
-    vocab_size = model.lm_head.out_features 
+    vocab_size = model.lm_head.out_features
 
     model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg["lr_peak"], weight_decay=cfg.get("weight_decay", 0.01), eps=1e-6)
-    scheduler = make_lm_scheduler(optimizer, cfg["max_steps"], 
-                                  warmup_pct=cfg["warmup_pct"], 
-                                  final_lr=cfg["final_lr"], 
+    scheduler = make_lm_scheduler(optimizer, cfg["max_steps"],
+                                  warmup_pct=cfg["warmup_pct"],
+                                  final_lr=cfg["final_lr"],
                                   peak_lr=cfg["lr_peak"])
     scaler_enabled = device.startswith("cuda") and hasattr(torch.cuda.amp, 'GradScaler')
     scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled) if scaler_enabled else None
 
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, reduction="sum")
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, reduction="sum") # Using sum for per-token loss calculation
 
     step = 0
     epoch = 0
     best_val_ppl = float("inf")
     best_state = None
     epochs_no_improve = 0
-    
-    pbar = tqdm(total=cfg["max_steps"], desc=f"[{model_name}] Training", unit="step", leave=True)
+
+    # Logging lists
+    logged_steps: List[int] = []
+    logged_train_losses: List[float] = [] # Per-token loss
+    logged_val_ppls: List[float] = []
+
+    log_interval = cfg.get("log_interval", 100) # Log every N steps, configurable
+
+    # Initialize a single progress bar
+    pbar = tqdm(total=cfg["max_steps"], desc=f"[{model_name}] Training", unit="step", leave=True, dynamic_ncols=True)
 
     while step < cfg["max_steps"]:
         model.train()
-        epoch_total_loss_sum = 0.0
-        epoch_total_tokens = 0
-        hidden_state = None 
+        hidden_state = None
 
         for i in range(0, train_data.size(1) - 1, bptt):
             if step >= cfg["max_steps"]: break
-            
+
             t0 = time.perf_counter()
             x_batch, y_batch = get_lm_batch(train_data, i, bptt)
             if x_batch is None: continue
-            
+
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             optimizer.zero_grad(set_to_none=True)
+
+            loss_is_invalid = False
+            current_batch_train_loss_per_token = float('nan') # Default for this step if things go wrong
 
             autocast_enabled = device.startswith("cuda") and scaler is not None
             with torch.cuda.amp.autocast(enabled=autocast_enabled):
                 logits, hidden_state_next = model(x_batch, hidden_state)
-                loss = criterion(logits.view(-1, vocab_size), y_batch.view(-1))
-            
+                loss_sum_batch = criterion(logits.view(-1, vocab_size), y_batch.view(-1))
+
             if hidden_state_next is not None:
-                if isinstance(hidden_state_next, tuple): 
+                if isinstance(hidden_state_next, tuple):
                     hidden_state = tuple(h.detach() for h in hidden_state_next)
-                elif isinstance(hidden_state_next, list) and all(isinstance(s, dict) for s in hidden_state_next): 
+                elif isinstance(hidden_state_next, list) and all(isinstance(s, dict) for s in hidden_state_next):
                     hidden_state = [{k: v.detach() for k, v in s_dict.items()} for s_dict in hidden_state_next]
                 elif hasattr(hidden_state_next, 'detach'):
                     hidden_state = hidden_state_next.detach()
-            
+
             num_tokens_batch = (y_batch != pad_idx).sum().item()
-            batch_loss_sum = loss.item()
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                #print(f"\nWarning: NaN or Inf loss at step {step} for {model_name}. Loss: {loss.item()}. Skipping update.")
-                pbar.update()
-                step += 1
-                if step >= cfg["max_steps"]: break
-                continue
+            if torch.isnan(loss_sum_batch) or torch.isinf(loss_sum_batch):
+                loss_is_invalid = True
+                pbar.set_postfix_str("loss=NaN/Inf, lr=...") # Keep postfix simple
+            else:
+                current_batch_train_loss_per_token = loss_sum_batch.item() / max(1, num_tokens_batch) if num_tokens_batch > 0 else float('nan')
+                if np.isnan(current_batch_train_loss_per_token):
+                    loss_is_invalid = True
 
-            if scaler:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                scaler.step(optimizer)
-                scaler.update()
-            else: 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                optimizer.step()
-            
-            scheduler.step()
-            
-            batch_time = time.perf_counter() - t0
+            if not loss_is_invalid:
+                if scaler:
+                    scaler.scale(loss_sum_batch).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss_sum_batch.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+                    optimizer.step()
+                scheduler.step()
+
             current_lr = scheduler.get_last_lr()[0]
-            
-            pbar.update()
-            display_loss = batch_loss_sum / max(1, num_tokens_batch) if num_tokens_batch > 0 else 0.0
-            pbar.set_postfix({
-                "loss": f"{display_loss:.4f}", "lr": f"{current_lr:.2e}", "b_time": f"{batch_time:.3f}s"
-            })
+            batch_time = time.perf_counter() - t0
 
-            epoch_total_loss_sum += batch_loss_sum
-            epoch_total_tokens += num_tokens_batch
+            # Update the single progress bar's postfix
+            if not loss_is_invalid:
+                pbar.set_postfix_str(f"loss={current_batch_train_loss_per_token:.4f}, lr={current_lr:.2e}, b_time={batch_time:.3f}s", refresh=True)
+            else:
+                pbar.set_postfix_str(f"loss=NaN/Inf, lr={current_lr:.2e}, b_time={batch_time:.3f}s", refresh=True)
+
+
+            if step % log_interval == 0 or step == cfg["max_steps"] - 1:
+                logged_steps.append(step)
+                logged_train_losses.append(current_batch_train_loss_per_token)
+
+                val_ppl_overall = evaluate_overall_ppl(model, val_data, bptt, device, pad_idx)
+                logged_val_ppls.append(val_ppl_overall if np.isfinite(val_ppl_overall) else float('nan'))
+
+                # REMOVED: tqdm.write(f"[{model_name}] Ep {epoch+1:2} Step {step}/{cfg['max_steps']} | ...")
+
+                improved_this_step = False
+                if np.isfinite(val_ppl_overall) and val_ppl_overall < best_val_ppl:
+                    best_val_ppl = val_ppl_overall
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    epochs_no_improve = 0
+                    improved_this_step = True
+
+                if not improved_this_step:
+                    if step > cfg["max_steps"] * 0.1:
+                        epochs_no_improve += 1
+
+                if epochs_no_improve >= cfg["patience"]:
+                    # REMOVED: tqdm.write(f"[{model_name}] Early stopping...")
+                    pbar.close()
+                    training_history = {"steps": logged_steps, "train_loss": logged_train_losses, "val_ppl": logged_val_ppls}
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                    return model, best_val_ppl, training_history
+
+            pbar.update(1) # Increment progress bar by 1 step
             step += 1
-            if step >= cfg["max_steps"]: break
-        
-        avg_epoch_train_loss = epoch_total_loss_sum / max(1, epoch_total_tokens) if epoch_total_tokens > 0 else float('inf')
-        train_ppl = math.exp(min(avg_epoch_train_loss, 700))
-
-        val_ppl_overall = evaluate_overall_ppl(model, val_data, bptt, device, pad_idx)
-        
-        if np.isnan(val_ppl_overall):
-             #print(f"\nWarning: {model_name} Val PPL is NaN at end of epoch {epoch+1}, step {step}.")
-             val_ppl_overall = float('inf')
-
-        tqdm.write(f"[{model_name}] Ep {epoch+1:2} Step {step}/{cfg['max_steps']} | Train PPL {train_ppl:7.2f} | Val PPL {val_ppl_overall:7.2f} | LR {current_lr:.2e}")
         epoch += 1
 
-        if val_ppl_overall < best_val_ppl:
-            best_val_ppl = val_ppl_overall
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
-        else:
-            if step > cfg["max_steps"]*.1 :
-                epochs_no_improve += 1
-            if epochs_no_improve >= cfg["patience"]:
-                tqdm.write(f"[{model_name}] Early stopping after {cfg['patience']} epochs of no Val PPL improvement.")
-                break
-    pbar.close()
-    
+    pbar.close() # Close the progress bar when training is done or max_steps reached
+    training_history = {"steps": logged_steps, "train_loss": logged_train_losses, "val_ppl": logged_val_ppls}
+    final_eval_ppl = best_val_ppl
+
     if best_state is not None:
         model.load_state_dict(best_state)
         final_eval_ppl = evaluate_overall_ppl(model, val_data, bptt, device, pad_idx)
-        tqdm.write(f"[{model_name}] Loaded best model state with Val PPL: {final_eval_ppl:.2f}")
-        return model, final_eval_ppl
+        # REMOVED: tqdm.write(f"[{model_name}] Loaded best model state with Val PPL: {final_eval_ppl:.2f}")
     elif (best_val_ppl == float('inf') or np.isnan(best_val_ppl)) and step >= cfg["max_steps"]:
-         tqdm.write(f"[{model_name}] Training finished, but no valid best state (Val PPL: {best_val_ppl}). Using last state.")
-         return model, evaluate_overall_ppl(model, val_data, bptt, device, pad_idx)
-    else:
-         tqdm.write(f"[{model_name}] Training did not converge to a valid state (best Val PPL: {best_val_ppl}).")
-         return None, best_val_ppl
+        # REMOVED: tqdm.write(f"[{model_name}] Training finished, but no valid best state (Val PPL: {best_val_ppl}). Using last state.")
+        final_eval_ppl = evaluate_overall_ppl(model, val_data, bptt, device, pad_idx) # final_eval_ppl was already assigned
+        # return model, final_eval_ppl, training_history # This return was here, but seems redundant given the flow
+    # else: # This 'else' covers cases where training might not have converged or no best_state was found
+        # REMOVED: tqdm.write(f"[{model_name}] Training did not converge to a valid state (best Val PPL: {best_val_ppl}).")
+        # Return current model (which might be the last state) and its corresponding PPL
+        # If no best_state and training ended early without finishing max_steps (e.g. by an error not caught by patience),
+        # final_eval_ppl would be best_val_ppl (potentially inf or nan).
+        # The return model, final_eval_ppl, training_history below covers this.
+
+    # Ensure final return path
+    if model is None and best_state is None: # e.g. if it failed very early or returned None before from early stopping
+        return None, best_val_ppl, training_history
+
+    return model, final_eval_ppl, training_history
 
 def assign_frequency_buckets(token_ids: torch.Tensor, freq_vec: torch.Tensor, bin_edges_tensor: torch.Tensor):
     freq = freq_vec.to(token_ids.device)[token_ids] 

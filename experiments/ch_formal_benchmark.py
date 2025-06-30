@@ -2,7 +2,7 @@ import torch, copy
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-import xlstm_replica as xlstm_scratch
+import xlstm_replica_old as xlstm_scratch
 from xlstm import (
     xLSTMBlockStack as LibXLSTMBlockStack,
     xLSTMBlockStackConfig as LibXLSTMBlockStackConfig,
@@ -12,6 +12,7 @@ from xlstm import (
 )
 from utils.training_loops import make_lm_scheduler
 from utils.plotting import plot_nns_results as plot_results
+from utils.model_architectures import GeneralHybridLM, GeneralHybridConfig
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────
 VOCAB = {"a":2, "b":3, "c":4, "(":5, ")":6, "#":1}  # 0=pad, 1=end-of-seq
@@ -25,7 +26,7 @@ LR_FINAL     = 1e-7
 DROPOUT      = 0.10
 WEIGHT_DECAY = 0.01
 CLIP_NORM    = 1.0
-PATIENCE     = 8
+PATIENCE     = 5
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 class FormalLangDataset(Dataset):
@@ -59,7 +60,6 @@ class FormalLangDataset(Dataset):
                 n = torch.randint(2, (SEQ_LEN-1)//3, (1,)).item()
                 seq = [VOCAB["a"]]*n + [VOCAB["b"]]*n + [VOCAB["c"]]*n
                 label = 1
-                # corrupt 50 % of the time
                 if torch.rand(1).item() < 0.5:
                     swap = torch.randint(0,len(seq),(2,))
                     seq[swap[0]], seq[swap[1]] = seq[swap[1]], seq[swap[0]]
@@ -131,7 +131,17 @@ def _cls_acc(model, loader, device):
     with torch.no_grad():
         for xb,yb in loader:
             xb=xb.to(device); yb=yb.to(device)
-            pred = model(xb).argmax(-1)   # [B,L]
+            
+            output = model(xb)
+            
+            if isinstance(output, tuple):
+                logits = output[0]  # The logits are the first element
+            else:
+                logits = output
+            
+            pred = logits.argmax(-1)   # [B,L]
+            # ------------------------------------
+
             hit += (pred[:,-1]==yb[:,-1]).sum().item()
             tot += xb.size(0)
     return hit/tot if tot else float("nan")
@@ -152,10 +162,81 @@ def run_formal_benchmark(device_str="cpu",
     if benchmark_type=="xlstm_vs_lib":
         models={"xLSTM-Scratch":_ScratchXLSTM(),
                 "xLSTM-Lib":_LibXLSTM()}
+    elif benchmark_type == "sm_combinations":
+        models = {}
+        sm_combinations = [
+            'SSSS', 'SSSM', 'SSMS', 'SMSS', 'MSSS', 'SSMM', 'SMSM', 'SMMS', 
+            'MSMS', 'MSSM', 'MMSS', 'SMMM', 'MSMM', 'MMSM', 'MMMS', 'MMMM'
+        ]
+        for combo in sm_combinations:
+            cfg = GeneralHybridConfig(
+                vocab_size=9,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM,
+                block_string=combo,
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (Formal)"] = GeneralHybridLM(cfg)
+            
+    elif benchmark_type == "lt_combinations":
+        models = {}
+        lt_combinations = [
+            'LLLL', 'LLLT', 'LLTL', 'LTLL', 'TLLL', 'LLTT', 'LTLT', 'LTTL', 
+            'TLTL', 'TLLT', 'TTLL', 'LTTT', 'TLTT', 'TTLT', 'TTTL', 'TTTT'
+        ]
+        for combo in lt_combinations:
+            cfg = GeneralHybridConfig(
+                vocab_size=9,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM,
+                block_string=combo,
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (Formal)"] = GeneralHybridLM(cfg)
+    # ─── 2-block xLSTM (S/M) sweep ─────────────────────────────────────
+    elif benchmark_type == "xlstm_two_block_combinations":
+        models = {}
+        for combo in (a + b for a in "SM" for b in "SM"):           # SS, SM, MS, MM
+            cfg = GeneralHybridConfig(
+                vocab_size=9,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM,
+                block_string=combo,          # e.g. "SM"
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (Formal)"] = GeneralHybridLM(cfg)
+
+    # ─── 2-block TL (L/T) sweep ────────────────────────────────────────
+    elif benchmark_type == "tl_two_block_combinations":
+        models = {}
+        for combo in (a + b for a in "LT" for b in "LT"):           # LL, LT, TL, TT
+            cfg = GeneralHybridConfig(
+                vocab_size=9,
+                embed_dim=EMBED_DIM,
+                hidden_dim=EMBED_DIM,
+                block_string=combo,
+                context_length=SEQ_LEN,
+                n_heads=4,
+                dropout=DROPOUT,
+                pad_idx=0
+            )
+            models[f"General-{combo} (Formal)"] = GeneralHybridLM(cfg)
+
     else:
         raise ValueError
 
-    results={}
+    results_scalar = {}               # overall accuracy (unchanged API)
+    results_heat   = {}               # 3-element list per model
+
     loss_fn=nn.CrossEntropyLoss(ignore_index=-1)
     for name,model in models.items():
         model.to(device)
@@ -168,8 +249,17 @@ def run_formal_benchmark(device_str="cpu",
                 if step>=TOTAL_STEPS: break
                 model.train(); xb=xb.to(device); yb=yb.to(device)
                 opt.zero_grad()
-                logits=model(xb).transpose(1,2)
-                loss=loss_fn(logits,yb)
+
+                output = model(xb)
+
+                if isinstance(output, tuple):
+                    logits = output[0]  
+                else:
+                    logits = output
+
+                logits = logits.transpose(1,2)
+                loss = loss_fn(logits,yb)
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(),CLIP_NORM)
                 opt.step(); sched.step(); step+=1
@@ -183,10 +273,29 @@ def run_formal_benchmark(device_str="cpu",
                     else:
                         stall+=1
         if best_state: model.load_state_dict(best_state)
-        results[name]=_cls_acc(model,val_loader,device)
-        print(f"{name} final acc: {results[name]:.3f}")
+        results_scalar[name] = _cls_acc(model, val_loader, device)
 
-    plot_results(results,"Formal-Language Validation Accuracy",
-                 "Accuracy (higher is better)",
-                 "formal_benchmark.png")
-    return results
+        # ② per-task accuracies -------------------------------------------------
+        task_accs = []
+        for fixed_typ in (0, 1, 2):                             # regular / CF / CS
+            task_ds      = FormalLangDataset(val_size, fixed_typ=fixed_typ)
+            task_loader  = DataLoader(task_ds, BATCH_SIZE)
+            acc_task     = _cls_acc(model, task_loader, device)
+            task_accs.append(acc_task)
+        results_heat[name] = task_accs
+
+        print(f"{name} final accs – overall: {results_scalar[name]:.3f} | "
+            f"Parity {task_accs[0]:.3f} | Dyck-1 {task_accs[1]:.3f} | "
+            f"aⁿbⁿcⁿ {task_accs[2]:.3f}")
+
+
+    plot_results(results_scalar,
+                "Formal-Language Validation Accuracy (overall)",
+                "Accuracy (higher is better)",
+                "formal_benchmark_overall.png")
+
+    # NEW – the heat-map view
+    from utils.plotting import plot_formal_heatmaps
+    plot_formal_heatmaps(results_heat,
+                        filename="formal_benchmark_heatmap.png")
+    return results_scalar
