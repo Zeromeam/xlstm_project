@@ -1,6 +1,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import Dict,Optional,Tuple
 # -------------------------------------------------------------------
@@ -247,12 +248,14 @@ from typing import List, Union
 class LSTMBlockCfg:
     hidden_dim: int
     dropout: float = 0.1           
-    bidirectional: bool = False    
+    bidirectional: bool = False   
+    num_layers: int = 1 
 
 @dataclass
 class TransformerBlockCfg:
-    hidden_dim: int
-    n_heads: int
+    hidden_dim: int = 128
+    n_heads: int = 4
+    num_layers: int = 2
     dropout: float = 0.1
 
 @dataclass
@@ -267,7 +270,7 @@ class _HybridLSTMBlock(nn.Module):
         super().__init__()
         self.lstm = nn.LSTM(cfg.hidden_dim,
                             cfg.hidden_dim,
-                            num_layers=1,
+                            num_layers=cfg.num_layers,
                             batch_first=True,
                             dropout=cfg.dropout,
                             bidirectional=cfg.bidirectional)
@@ -277,6 +280,91 @@ class _HybridLSTMBlock(nn.Module):
     def forward(self, x, hidden=None):
         out, h = self.lstm(x, hidden)
         return self.dropout(self.norm(out)), h
+
+class _ALiBiAttention(nn.Module):
+    """Multi‑head self‑attention with ALiBi relative positional bias.
+    Works in causal mode only (is_causal=True).
+    """
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("_slopes", self._build_slopes(n_heads), persistent=False)
+
+    @staticmethod
+    def _build_slopes(n_heads: int) -> torch.Tensor:
+        """Slopes from the ALiBi paper (https://arxiv.org/abs/2108.12409)."""
+        def get_pow2_slopes(n):
+            start = 2 ** (-2 ** -(math.log2(n) - 3))
+            ratio = start
+            return [start * ratio ** i for i in range(n)]
+        if math.log2(n_heads).is_integer():
+            slopes = get_pow2_slopes(n_heads)
+        else:  # handle non‑power‑of‑two num_heads
+            closest_pow2 = 2 ** math.floor(math.log2(n_heads))
+            slopes = get_pow2_slopes(closest_pow2)
+            slopes += get_pow2_slopes(2 * closest_pow2)[0::2][: n_heads - closest_pow2]
+        return torch.tensor(slopes).view(n_heads, 1, 1)  # (h,1,1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, d = x.size()
+        qkv = self.qkv(x)  # (b,s,3d)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(b, s, self.n_heads, self.head_dim).transpose(1, 2)  # (b,h,s,hd)
+        k = k.view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
+
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale  # (b,h,s,s)
+        # build ALiBi bias on the fly (no large pre‑allocated tensor)
+        pos = torch.arange(s, device=x.device)
+        bias = pos.unsqueeze(0) - pos.unsqueeze(1)  # (s,s)
+        bias = bias.unsqueeze(0).type_as(attn_scores)  # (1,1,s,s) via broadcasting later
+        attn_scores = attn_scores - self._slopes * bias  # larger distance → more negative
+
+        mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
+        attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = (attn_weights @ v).transpose(1, 2).contiguous().view(b, s, d)
+        return self.o_proj(out)
+
+class _TransformerLayer(nn.Module):
+    def __init__(self, cfg: TransformerBlockCfg):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.hidden_dim)
+        self.attn = _ALiBiAttention(cfg.hidden_dim, cfg.n_heads, dropout=cfg.dropout)
+        self.ln2 = nn.LayerNorm(cfg.hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.hidden_dim * 4, cfg.hidden_dim),
+        )
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.dropout(self.attn(self.ln1(x)))
+        x = x + self.dropout(self.ff(self.ln2(x)))
+        return x
+
+class RelativeTransformerBlock(nn.Module):
+    """Drop‑in replacement for _HybridTransformerBlock.
+    Returns (output, None) so that GeneralHybridLM can ignore the second value.
+    """
+    def __init__(self, cfg: TransformerBlockCfg, max_len: int):  # max_len kept for API compatibility
+        super().__init__()
+        self.layers = nn.ModuleList([_TransformerLayer(cfg) for _ in range(cfg.num_layers)])
+
+    def forward(self, x: torch.Tensor, *_):
+        for layer in self.layers:
+            x = layer(x)
+        return x, None
 
 class _HybridTransformerBlock(nn.Module):
     """
@@ -293,9 +381,10 @@ class _HybridTransformerBlock(nn.Module):
             dim_feedforward=cfg.hidden_dim * 4,
             dropout=cfg.dropout,
             activation="gelu",
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
-        self.enc = nn.TransformerEncoder(layer, num_layers=1)
+        self.enc = nn.TransformerEncoder(layer, num_layers=cfg.num_layers)
         self.norm = nn.LayerNorm(cfg.hidden_dim)
 
     def forward(self, x, *_):
@@ -303,10 +392,13 @@ class _HybridTransformerBlock(nn.Module):
         mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device) * float('-inf'), diagonal=1)
         
         # Applies its own positional encoding to the input it receives.
-        h = self.pos(x)
-        h = self.enc(h, mask=mask, is_causal=True)
-        
-        return self.norm(h), None
+        #x = self.pos(x)
+        #h = x 
+        #h = self.enc(h, mask=mask, is_causal=True)
+        x = self.enc(x, mask=mask, is_causal=True)
+        # x = self.enc(x, is_causal=True)
+
+        return self.norm(x), None
  
 
 class HybridStackCoreLM(nn.Module):
@@ -321,8 +413,10 @@ class HybridStackCoreLM(nn.Module):
         for blk_cfg in cfg.blocks:
             if isinstance(blk_cfg, LSTMBlockCfg):
                 self.blocks.append(_HybridLSTMBlock(blk_cfg))
+            # elif isinstance(blk_cfg, TransformerBlockCfg):
+            #     self.blocks.append(_HybridTransformerBlock(blk_cfg, cfg.max_len))
             elif isinstance(blk_cfg, TransformerBlockCfg):
-                self.blocks.append(_HybridTransformerBlock(blk_cfg, cfg.max_len))
+                self.blocks.append(RelativeTransformerBlock(blk_cfg, cfg.max_len))
             else:
                 raise ValueError(f"Unknown block cfg {type(blk_cfg)}")
         self.out_dim = cfg.blocks[0].hidden_dim  
@@ -378,6 +472,7 @@ class GeneralHybridConfig:
     n_heads: int = 4          
     dropout: float = 0.1
     pad_idx: int = 0
+    num_layers: int = 1
     def __post_init__(self):
         allowed = set("tlms")
         if not set(self.block_string.lower()) <= allowed:
@@ -395,9 +490,9 @@ class GeneralHybridLM(nn.Module):
         
         # --- ADDED: The critical input projection layer. ---
         # It maps the embedding dimension to the model's hidden dimension.
-        self.proj_in = nn.Linear(cfg.embed_dim, cfg.hidden_dim)
+        #self.proj_in = nn.Linear(cfg.embed_dim, cfg.hidden_dim)
 
-        self.dropout = nn.Dropout(cfg.dropout)
+        self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
         self.blocks = nn.ModuleList([self._make_block(sym) for sym in cfg.blocks])
 
         # --- REMOVED: Final LayerNorm. The successful model does not have this. ---
@@ -405,31 +500,53 @@ class GeneralHybridLM(nn.Module):
         
         self.lm_head = nn.Linear(cfg.hidden_dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight  # weight tying
-        self.apply(self._init_weights)
+        # self.apply(self._init_weights)
 
+        self.use_pos_enc = any(sym == "t" for sym in cfg.blocks)
+        self.use_proj_in = (cfg.embed_dim != cfg.hidden_dim)
+
+
+        if self.use_pos_enc:
+            self.pos_enc_once = PositionalEncoding(
+                cfg.hidden_dim, cfg.context_length, dropout=cfg.dropout
+            )
+        if self.use_proj_in:
+            self.proj_in = nn.Linear(cfg.embed_dim, cfg.hidden_dim)
+            self._init_weights(self.proj_in)
+
+
+        _init_emb(self.embed); _init_linear(self.lm_head)
     def _make_block(self, sym: str) -> nn.Module:
         cfg = self.cfg
         d = self.cfg.hidden_dim
         if sym == 'l':
-            lstm_block_cfg = LSTMBlockCfg(hidden_dim=d, dropout=cfg.dropout)
+            lstm_block_cfg = LSTMBlockCfg(hidden_dim=d, dropout=cfg.dropout,num_layers=cfg.num_layers)
             return _HybridLSTMBlock(lstm_block_cfg)
         if sym == 't':
-            transformer_block_cfg = TransformerBlockCfg(hidden_dim=d, n_heads=cfg.n_heads, dropout=cfg.dropout)
+            transformer_block_cfg = TransformerBlockCfg(hidden_dim=d, n_heads=cfg.n_heads, dropout=cfg.dropout, num_layers=cfg.num_layers  )
             return _HybridTransformerBlock(transformer_block_cfg, max_len=cfg.context_length)
+        # if sym == 't':
+        #     transformer_block_cfg = TransformerBlockCfg(
+        #         hidden_dim=d, n_heads=cfg.n_heads,
+        #         dropout=cfg.dropout, num_layers=cfg.num_layers)
+        #     return RelativeTransformerBlock(transformer_block_cfg, max_len=cfg.context_length)
         if sym == 'm':
             mlstm_cfg = mLSTMBlockConfig(
                 mlstm=mLSTMLayerConfig(
+                    embedding_dim=d,
+                    context_length=self.cfg.context_length,
                     conv1d_kernel_size=4,
                     qkv_proj_blocksize=4,
                     num_heads=self.cfg.n_heads,
-                )
+                ),
             )
             stack = xLSTMBlockStack(
                 xLSTMBlockStackConfig(
                     mlstm_block=mlstm_cfg,
                     context_length=self.cfg.context_length,
-                    num_blocks=1,
+                    num_blocks=cfg.num_layers,
                     embedding_dim=d,
+                    add_post_blocks_norm=True,  
                 )
             )
             return XLSTMWrapper(stack)
@@ -447,7 +564,7 @@ class GeneralHybridLM(nn.Module):
                 xLSTMBlockStackConfig(
                     slstm_block=slstm_cfg,
                     context_length=self.cfg.context_length,
-                    num_blocks=1,
+                    num_blocks=cfg.num_layers,
                     embedding_dim=d,
                 )
             )
@@ -461,11 +578,16 @@ class GeneralHybridLM(nn.Module):
 
     def forward(self, idx, hidden=None):
         x = self.embed(idx)
-        
+
         # --- Apply the projection and dropout ---
-        x = self.proj_in(x)
+        if self.use_proj_in:
+            x = self.proj_in(x) 
+        # x = x * math.sqrt(self.cfg.hidden_dim)
+        if self.use_pos_enc :
+            x = x * math.sqrt(self.cfg.hidden_dim)
+            x = self.pos_enc_once(x)
         x = self.dropout(x)
-        
+
         for blk in self.blocks:
             x, hidden = blk(x, hidden)
             
@@ -483,3 +605,12 @@ class XLSTMWrapper(nn.Module):
     def forward(self, x, hidden=None):
         x_out = self.stack(x)
         return x_out, None
+    
+
+def _init_linear(m: nn.Linear):
+    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+    if m.bias is not None:
+        nn.init.zeros_(m.bias)
+
+def _init_emb(e: nn.Embedding):
+    nn.init.normal_(e.weight, mean=0.0, std=0.02)

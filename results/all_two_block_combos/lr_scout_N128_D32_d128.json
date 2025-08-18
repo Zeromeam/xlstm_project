@@ -1,0 +1,18 @@
+{
+  "General-LL (MQAR)": 0.01,
+  "General-LM (MQAR)": 0.01,
+  "General-LS (MQAR)": 0.01,
+  "General-LT (MQAR)": 0.01,
+  "General-ML (MQAR)": 0.01,
+  "General-MM (MQAR)": 0.01,
+  "General-MS (MQAR)": 0.01,
+  "General-MT (MQAR)": 0.01,
+  "General-SL (MQAR)": 0.01,
+  "General-SM (MQAR)": 0.01,
+  "General-SS (MQAR)": 0.001,
+  "General-ST (MQAR)": 0.01,
+  "General-TL (MQAR)": 0.01,
+  "General-TM (MQAR)": 0.01,
+  "General-TS (MQAR)": 0.01,
+  "General-TT (MQAR)": 0.01
+}

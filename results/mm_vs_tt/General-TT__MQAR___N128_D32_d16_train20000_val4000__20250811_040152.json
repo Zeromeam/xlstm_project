@@ -1,0 +1,30 @@
+{
+  "timestamp": "20250811_040152",
+  "benchmark_type": "mm_vs_tt",
+  "model_name": "General-TT (MQAR)",
+  "run": {
+    "model_name": "General-TT (MQAR)",
+    "benchmark_type": "mm_vs_tt",
+    "device": "cuda",
+    "seq_len": 128,
+    "kv_pairs": 32,
+    "embed_dim": 16,
+    "n_heads": 1,
+    "epochs": 25,
+    "batch_size": 64,
+    "train_size": 20000,
+    "val_size": 4000,
+    "lr_grid": [
+      0.01
+    ],
+    "weight_decay": 0.1,
+    "warmup_frac": 0.1
+  },
+  "val_acc_per_lr": {
+    "1.0e-02": 0.9868231160193262
+  },
+  "best": {
+    "lr": 0.01,
+    "val_acc": 0.9868231160193262
+  }
+}

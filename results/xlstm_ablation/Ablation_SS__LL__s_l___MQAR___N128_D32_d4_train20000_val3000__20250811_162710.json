@@ -1,0 +1,30 @@
+{
+  "timestamp": "20250811_162710",
+  "benchmark_type": "xlstm_ablation",
+  "model_name": "Ablation[SS] LL (s→l) (MQAR)",
+  "run": {
+    "model_name": "Ablation[SS] LL (s→l) (MQAR)",
+    "benchmark_type": "xlstm_ablation",
+    "device": "cuda",
+    "seq_len": 128,
+    "kv_pairs": 32,
+    "embed_dim": 4,
+    "n_heads": 1,
+    "epochs": 35,
+    "batch_size": 64,
+    "train_size": 20000,
+    "val_size": 3000,
+    "lr_grid": [
+      0.01
+    ],
+    "weight_decay": 0.1,
+    "warmup_frac": 0.1
+  },
+  "val_acc_per_lr": {
+    "1.0e-02": 0.02213272464356992
+  },
+  "best": {
+    "lr": 0.01,
+    "val_acc": 0.02213272464356992
+  }
+}
