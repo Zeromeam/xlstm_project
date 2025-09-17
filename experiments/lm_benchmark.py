@@ -407,12 +407,12 @@ def run_lm_benchmark(device_str: str, benchmark_type: str = "xlstm_vs_lib"):
                                 filename=f"lm_benchmark_ablation_{ablation['suffix']}_final_ppl.png",
                                 title_override=plot_title_template_final_ppl.format(variant_name=ablation['name']))
 
-            if baseline_history and variant_history:  # Using 'variant_history'
+            if baseline_history and variant_history: 
                 
                 variant_actual_max_step = 0
                 if variant_history:
                     all_variant_run_steps = []
-                    for history_run in variant_history: # history_run is a Dict
+                    for history_run in variant_history: 
                         if history_run and history_run.get("steps"):
                             all_variant_run_steps.extend(history_run.get("steps"))
                     if all_variant_run_steps:

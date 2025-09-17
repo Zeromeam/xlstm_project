@@ -18,12 +18,12 @@ from utils.plotting import plot_mqar_heatmap, plot_mqar_capacity_panels
 # Global defaults
 # -------------------------
 SEED        = 1337
-VOCAB_SIZE  = 8192      # |C|
-SEQ_LEN     = 128       # N  (sweep can overwrite)
-KV_PAIRS    = 32        # D
-EMBED_DIM   = 128       # d_model
-N_HEADS     = 1         # Zoology synthetic runs use a single head
-DROPOUT     = 0.0       # no dropout in Appendix E/E.2
+VOCAB_SIZE  = 8192      
+SEQ_LEN     = 128       
+KV_PAIRS    = 32       
+EMBED_DIM   = 128      
+N_HEADS     = 1         
+DROPOUT     = 0.0      
 
 EPOCHS      = 35
 #LR_GRID     = (1e-4, 3e-4, 1e-3, 3e-3)  # four LRs between 1e-4 and 1e-2
@@ -31,12 +31,12 @@ LR_GRID     = (1e-2,)
 WEIGHT_DECAY= 0.1
 WARMUP_FRAC = 0.10
 
-EARLY_STOP      = True       # set True to enable
-ES_PATIENCE     = 7          # stop if no improvement for this many epochs
-ES_MIN_EPOCHS   = 5          # don't stop before this many epochs
-ES_MIN_DELTA    = 1e-4       # required improvement over best so far
-ES_RESTORE_BEST = True       # load best weights before returning
-MAX_MINUTES     = None       # e.g., 15.0 to stop after ~15 minutes
+EARLY_STOP      = True       
+ES_PATIENCE     = 7         
+ES_MIN_EPOCHS   = 5          
+ES_MIN_DELTA    = 1e-4       
+ES_RESTORE_BEST = True      
+MAX_MINUTES     = None       
 # -------------------------
 # Utilities
 # -------------------------
@@ -46,7 +46,6 @@ def _set_all_seeds(seed: int = SEED):
 
 def _batch_size_by_rule(n: int, d: int) -> int:
     # Zoology Appendix E/E.2 policy:
-    # 64 otherwise; 16 if N>=256 or d>=256; 8 if N>=512 or d>=512
     if n >= 512 or d >= 512: return 8
     if n >= 256 or d >= 256: return 16
     return 64
@@ -66,7 +65,6 @@ def _save_json(path: str, obj) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def _print_run_header(header: Dict):
-    # Nicely print a consistent header before each model
     print("\n" + "="*78)
     print(f"[Run] {header.get('model_name','(unknown)')}")
     for k in [
@@ -78,15 +76,15 @@ def _print_run_header(header: Dict):
     print("="*78)
 
 # -------------------------
-# MQAR (Zoology) data generation — Appendix E Algorithm 1
+# MQAR 
 # -------------------------
 @dataclass
 class MQARZoologyConfig:
     vocab_size: int = VOCAB_SIZE
     seq_len: int    = SEQ_LEN
     kv_pairs: int   = KV_PAIRS
-    alpha: float    = 0.1     # power-law parameter (Appendix E)
-    filler_id: int  = 0       # fixed filler id; reserve keys from 1..V/2-1 to avoid collision
+    alpha: float    = 0.1     
+    filler_id: int  = 0       
     train_examples: int = 100_000
     val_examples:   int = 3_000
 
@@ -199,166 +197,6 @@ def _make_datasets(cfg: MQARZoologyConfig) -> Tuple[TensorDataset, TensorDataset
     return TensorDataset(x_tr, qm_tr, y_tr), TensorDataset(x_va, qm_va, y_va)
 #import glob
 
-# def _collect_existing_mqar_results(
-#     results_dir: str,
-#     *,
-#     benchmark_type: str,
-#     seq_len: int,
-#     kv_pairs: int,
-#     embed_dim: int,
-#     train_size: int,
-#     val_size: int
-# ) -> Dict[str, List[float]]:
-#     """
-#     Returns {model_name: [val_acc, ...]} for runs that exactly match the config.
-#     We read the per-model JSONs saved by run_mqar_benchmark(...).
-#     """
-#     existing: Dict[str, List[float]] = {}
-#     for path in glob.glob(os.path.join(results_dir, "*.json")):
-#         try:
-#             with open(path, "r", encoding="utf-8") as f:
-#                 j = json.load(f)
-#         except Exception:
-#             continue
-#         # only consider per-model receipts with 'run' and 'best'
-#         run = j.get("run", {})
-#         best = j.get("best", {})
-#         if not run or "val_acc" not in best:
-#             continue
-#         if j.get("benchmark_type") != benchmark_type:
-#             continue
-#         # strict match on config (so we don’t mix apples/oranges)
-#         if (
-#             run.get("seq_len") == seq_len and
-#             run.get("kv_pairs") == kv_pairs and
-#             run.get("embed_dim") == embed_dim and
-#             run.get("train_size") == train_size and
-#             run.get("val_size") == val_size
-#         ):
-#             name = j.get("model_name", "")
-#             acc  = best.get("val_acc", None)
-#             if isinstance(acc, (int, float)) and math.isfinite(acc):
-#                 existing.setdefault(name, []).append(float(acc))
-#     return existing
-
-
-# def resume_sweep_mqar_capacity(
-#     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
-#     *,
-#     benchmark_type: str = "xlstm_ablation",
-#     kv_settings: Tuple[int, ...] = (16, 32),
-#     width_settings: Tuple[int, ...] = (64, 128, 256),
-#     seq_len: int = 128,
-#     train_size: int = 20_000,
-#     val_size: int = 4_000,
-#     repetitions: int = 5
-# ) -> Dict[int, Dict[str, Dict[int, List[float]]]]:
-#     """
-#     Exactly like sweep_mqar_capacity(...), but:
-#       • Looks in results/<benchmark_type>/ for matching JSONs you already saved
-#       • Skips combinations (kv, width, model) that already have >= repetitions runs
-#       • Runs only the missing reps
-#       • Rebuilds plots and a fresh summary JSON
-#     """
-#     global SEQ_LEN, EMBED_DIM
-#     _set_all_seeds(SEED)
-#     device = torch.device(device_str)
-
-#     out_dir = _ensure_dir(os.path.join("results", _safe_name(benchmark_type)))
-#     dataset_cache: dict[Tuple[int, int, int, int], Tuple[TensorDataset, TensorDataset]] = {}
-#     results_by_kv: Dict[int, Dict[str, Dict[int, List[float]]]] = {}
-
-#     for kv in kv_settings:
-#         cache_key = (seq_len, kv, train_size, val_size)
-#         if cache_key not in dataset_cache:
-#             cfg = MQARZoologyConfig(
-#                 vocab_size=VOCAB_SIZE, seq_len=seq_len, kv_pairs=kv,
-#                 train_examples=train_size, val_examples=val_size
-#             )
-#             dataset_cache[cache_key] = _make_datasets(cfg)
-#         prebuilt_ds = dataset_cache[cache_key]
-
-#         for width in width_settings:
-#             SEQ_LEN = seq_len
-#             EMBED_DIM = width
-#             bs = _batch_size_by_rule(seq_len, width)
-
-#             # Build the model dict once, just to know expected names
-#             models = _build_models(benchmark_type, VOCAB_SIZE, EMBED_DIM, SEQ_LEN, N_HEADS, num_layers=1)
-#             model_names = list(models.keys())
-
-#             # Load what you already have on disk for THIS (kv,width,seq_len,train,val,embed_dim)
-#             existing = _collect_existing_mqar_results(
-#                 out_dir,
-#                 benchmark_type=benchmark_type,
-#                 seq_len=seq_len, kv_pairs=kv, embed_dim=width,
-#                 train_size=train_size, val_size=val_size
-#             )
-
-#             # Seed results_by_kv with the existing lists
-#             for m in model_names:
-#                 already = existing.get(m, [])
-#                 results_by_kv.setdefault(kv, {}).setdefault(m, {}).setdefault(width, []).extend(already)
-
-#             # How many more do we need per model?
-#             for m in model_names:
-#                 have = len(results_by_kv[kv][m][width])
-#                 need = max(0, repetitions - have)
-#                 if need == 0:
-#                     print(f"[resume] KV={kv} d={width} {m}: have {have}/{repetitions} → skipping")
-#                     continue
-
-#                 print(f"[resume] KV={kv} d={width} {m}: have {have}/{repetitions} → running {need} more")
-#                 # Run the missing reps one by one (keeping dataset/BS identical)
-#                 for rep_idx in range(have + 1, have + need + 1):
-#                     run_out = run_mqar_benchmark(
-#                         device_str=device_str,
-#                         benchmark_type=benchmark_type,
-#                         kv_pairs=kv,
-#                         train_size=train_size,
-#                         val_size=val_size,
-#                         prebuilt_ds=prebuilt_ds,
-#                         batch_size_override=bs,
-#                         results_dir=out_dir,
-#                         rep_index=rep_idx,
-#                         rep_total=repetitions
-#                     )
-#                     # Collect this model’s new number
-#                     if m in run_out:
-#                         results_by_kv[kv][m][width].append(run_out[m])
-
-#     # ── plots (same behavior as sweep_mqar_capacity) ─────────────────────────
-#     if benchmark_type.startswith("xlstm_ablation"):
-#         _plot_ablation_triads(results_by_kv, out_dir=out_dir, context_len=seq_len)  # uses your existing helper
-#     else:
-#         panels_path = os.path.join(out_dir, f"capacity_panels_N{seq_len}_train{train_size}_val{val_size}.png")
-#         plot_mqar_capacity_panels(results_by_kv, context_len=seq_len, save_path=panels_path)
-#         print(f"Capacity panels saved → {panels_path}")
-
-#     # Heatmap (best width per model at largest KV), same as your original
-#     try:
-#         kv_for_heatmap = max(results_by_kv.keys())
-#         flat_for_heatmap: Dict[str, float] = {}
-#         for model_name, width_dict in results_by_kv[kv_for_heatmap].items():
-#             best_w, best_mean = None, float("-inf")
-#             for w, accs in width_dict.items():
-#                 m = float(np.mean(accs)) if accs else float("-inf")
-#                 if not math.isfinite(m): m = float("-inf")
-#                 if m >= best_mean: best_mean, best_w = m, w
-#             label = f"{model_name} [d={best_w}]" if best_w is not None else model_name
-#             flat_for_heatmap[label] = 0.0 if best_mean == float("-inf") else best_mean
-#         heatmap_path = os.path.join(out_dir, f"mqar_heatmap_N{seq_len}_kv{kv_for_heatmap}.png")
-#         plot_mqar_heatmap(flat_for_heatmap, filename=heatmap_path)
-#         print(f"Heatmap saved → {heatmap_path}")
-#     except Exception as e:
-#         print("Heatmap skipped due to error:", e)
-
-#     # Save a refreshed aggregate summary
-#     summary_path = os.path.join(out_dir, f"summary_N{seq_len}_train{train_size}_val{val_size}.json")
-#     _save_json(summary_path, results_by_kv)
-#     print(f"Summary JSON saved → {summary_path}")
-
-#     return results_by_kv
 
 import glob
 
@@ -666,7 +504,6 @@ def _train_one_model(model: nn.Module,
             best_val = val_acc
             no_improve = 0
             if restore_best:
-                # keep a light copy on CPU
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             no_improve += 1
@@ -676,11 +513,10 @@ def _train_one_model(model: nn.Module,
             print(f"    [ES] stop at epoch {epoch} (best={best_val:.4f}, no_improve={no_improve})")
             break
 
-    # restore best weights for fair reporting
+
     if restore_best and best_state is not None:
         model.load_state_dict(best_state)
 
-    # best_val is what we want to return
     return 0.0 if best_val == float("-inf") else best_val
 
 # ------------------------------------------------------------------------------
@@ -707,7 +543,6 @@ def run_mqar_benchmark(device_str: str = "cuda" if torch.cuda.is_available() els
         # # Full header printed for each model
 
         # _print_run_header(header)
-    # Build (or reuse) dataset with fixed order across runs
     if prebuilt_ds is None:
         cfg = MQARZoologyConfig(
             vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN, kv_pairs=kv_pairs,
@@ -800,15 +635,11 @@ def _plot_ablation_triads(results_by_kv, out_dir: str, context_len: int):
         if mtag: 
             m_base = mtag.group(1)
         else:
-            # if someone renamed labels, fallback: try to infer from leading token
-            # (won't trigger with our current labels; safe no-op otherwise)
             pass
         if m_base:
             triads.setdefault(m_base, []).append(m)
 
-    # Make a figure per base
     for base, models in sorted(triads.items()):
-        # filter the big dict down to only these models
         sub = {}
         for kv, panel in results_by_kv.items():
             sub[kv] = {m: panel[m] for m in panel.keys() if m in models}
@@ -895,7 +726,6 @@ def sweep_mqar_capacity(device_str: str = "cuda" if torch.cuda.is_available() el
         print(f"Capacity panels saved → {panels_path}")
 
 
-    # ---- Heatmap summary: best width per model at largest KV -----------------
     try:
         kv_for_heatmap = max(results_by_kv.keys())
         flat_for_heatmap: Dict[str, float] = {}
@@ -940,7 +770,6 @@ def lr_scout_all_two_block_combos(
     _set_all_seeds(SEED)
     device = torch.device(device_str)
 
-    # Build dataset once (cached locally inside function)
     cfg = MQARZoologyConfig(
         vocab_size=VOCAB_SIZE, seq_len=seq_len, kv_pairs=kv_pairs,
         train_examples=train_size, val_examples=val_size
@@ -950,7 +779,7 @@ def lr_scout_all_two_block_combos(
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=False, drop_last=True,  pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False, drop_last=False, pin_memory=True)
 
-    # Temporarily override globals for builder
+    
     global SEQ_LEN, EMBED_DIM
     old_seq, old_w = SEQ_LEN, EMBED_DIM
     SEQ_LEN, EMBED_DIM = seq_len, width

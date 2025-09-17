@@ -71,17 +71,14 @@ class FormalLangDataset(Dataset):
             if typ == 0:
                 # choose even / odd with equal probability ------------------
                 want_odd = bool(torch.randint(0, 2, ()).item())
-                # sample a length that matches the desired parity
-                #   min length 4 avoids degenerate strings
                 length = torch.randint(4, SEQ_LEN - 1, ()).item()
-                if length % 2 != want_odd:           # flip if parity wrong
+                if length % 2 != want_odd:           
                     length += 1 if length < SEQ_LEN - 2 else -1
                 if PARITY_DISTRACTORS:
-                    # ~50 % of positions become distractors
-                    seq = torch.randint(2, 5, (length,)).tolist()  # ids 2 = a, 3 = b, 4 = c
+                    seq = torch.randint(2, 5, (length,)).tolist()  
                 else:
                     seq = [VOCAB["a"]] * length
-                label = length % 2                   # 0 = even, 1 = odd
+                label = length % 2                   
                 inp, tgt = _pad_and_pack(seq, label)
 
             # ── 1. Dyck-1 (context-free) ───────────────────────────────────
@@ -338,9 +335,6 @@ def run_formal_benchmark(device_str="cpu",
                 tag = "Formal" if "formal" in __file__ else "MQAR"
                 models[f"General-{combo} ({tag})"] = GeneralHybridLM(cfg)
         elif benchmark_type == "missing_models_only":
-            # Only the “both-substitutions” variants that were missing:
-            #   - LT: from base SM (S→L and M→T)
-            #   - TL: from base MS (S→L and M→T)
             models = {}
             for combo in ("LT", "TL"):
                 cfg = GeneralHybridConfig(
@@ -352,7 +346,7 @@ def run_formal_benchmark(device_str="cpu",
                     n_heads=N_HEADS,
                     dropout=DROPOUT,
                     pad_idx=0,
-                    num_layers=1                 # keep 2‑block parity with other tests
+                    num_layers=1                 
                 )
                 models[f"General-{combo} (Formal)"] = GeneralHybridLM(cfg)
 
@@ -366,8 +360,8 @@ def run_formal_benchmark(device_str="cpu",
             2: "aⁿbⁿcⁿ (context-sensitive)"
         }
 
-        results_heat   = {}   # 3 values per model (one per task)
-        results_scalar = {}   # optional overall average, keeps old bar-plot working
+        results_heat   = {}   
+        results_scalar = {}   
         loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
         
         for name, model_proto in models.items():
@@ -379,13 +373,11 @@ def run_formal_benchmark(device_str="cpu",
 
                 val_ds   = FormalLangDataset(val_size)
 
-                         # reset to short strings for next task
                 train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True)
                 val_loader   = DataLoader(val_ds,  BATCH_SIZE)
 
-                # ── fresh copy of the model (keeps original weights intact) ────
                 model = copy.deepcopy(model_proto).to(device)
-                for p in model.parameters():               # quick re-initialisation
+                for p in model.parameters():               
                     if p.dim() > 1:  nn.init.xavier_uniform_(p)
 
                 opt   = optim.AdamW(model.parameters(), lr=LR_PEAK, weight_decay=WEIGHT_DECAY)
