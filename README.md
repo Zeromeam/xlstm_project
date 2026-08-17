@@ -1,74 +1,124 @@
-# xLSTM Hybrid Benchmarks
+# Attention-Recurrent Hybrids
 
-An experiment suite for asking a focused question: how do two-block combinations
-of matrix-LSTM, scalar-LSTM, conventional LSTM, and Transformer blocks behave on
-memory-intensive sequence tasks?
+**An ablation study of xLSTM blocks on associative recall and formal
+languages.**
 
-The repository contains benchmark code, notebooks, committed JSON results, and
-the figures produced from those results. It covers Multi-Query Associative Recall
-(MQAR) and Chomsky-hierarchy formal-language tasks.
+This repository contains the implementation, experiment notebooks, recorded
+results, and figures for a capacity-matched comparison of xLSTM, standard LSTM,
+and Transformer blocks in two-block sequence models.
 
-![Formal-language ablation panels](results/formal_ablation_panels.png)
+## Central research question
 
-## What was tested
+> Under matched model capacity, data, and training, does replacing the xLSTM
+> matrix-memory block (mLSTM) with a Transformer block and/or replacing the
+> xLSTM scalar-memory block (sLSTM) with a standard LSTM yield a measurable
+> performance advantage on MQAR and Chomsky-hierarchy formal-language tasks?
 
-- Capacity sweeps over embedding width for complete two-block configurations
-- Architecture ablations that exchange one recurrent or attention block at a time
-- MQAR at explicit sequence length and key-value count settings
-- Formal-language experiments with repeated runs where the committed results
-  support uncertainty estimates
+## Ablation design
 
-The benchmark implementations are in experiments/, shared model and training
-code is in utils/, and main_thesis.ipynb is the experiment control surface.
+Every model is represented by a two-letter block string:
 
-## One result, in context
+- `S` — sLSTM
+- `M` — mLSTM
+- `L` — standard LSTM
+- `T` — Transformer
 
-For the committed MQAR sweep at N=128 and KV=32, General-MM and General-TT are
-both evaluated over the full width range 2, 4, 8, 16, 32, 64, and 128. At width
-8 the recorded validation scores differ sharply (0.984 for MM and 0.532 for TT);
-by width 16 both are approximately 0.987.
+For each base xLSTM stack, the study replaces `S` with `L`, `M` with `T`, or
+both while holding the model interface and experimental conditions constant.
 
-This is a capacity observation for this task and training setup—not a claim that
-one architecture is universally better. The capacity points are single runs, so
-the repository does not attach confidence intervals to that curve. Repeated
-formal-language ablations are summarized separately with mean and 95% confidence
-intervals.
+| Base stack | Matched comparison set |
+| --- | --- |
+| `SS` | `SS`, `LL` |
+| `SM` | `SM`, `LM`, `ST`, `LT` |
+| `MS` | `MS`, `TS`, `ML`, `TL` |
+| `MM` | `MM`, `TT` |
 
-![MQAR capacity comparison](results/mm_vs_tt/capacity_panels_N128_train20000_val4000.png)
+The unified wrapper keeps the token embeddings, output heads, hidden width,
+block depth, sequence length, number of heads, normalization, and dropout policy
+fixed across matched substitutions. Each model-benchmark configuration is
+evaluated with five independent seeds. Results are reported as the mean with a
+two-sided 95% confidence interval.
 
-The compact JSON behind the comparison is
-results/mm_vs_tt/summary_N128_train20000_val4000.json. Raw run files remain
-alongside it so the plotted range can be audited.
+## Benchmarks
 
-## Reproduce
+### Multi-Query Associative Recall
 
-The committed environment targets Python 3.12, PyTorch 2.5.1, CUDA 12.1, and
-xlstm 1.0.8.
+MQAR measures content-based retrieval. A sequence introduces key-value pairs and
+later repeats the keys among distractor tokens. Accuracy is measured only at the
+query positions, where the model must predict the associated value.
 
-    conda env create -f environment.yml
-    conda activate xlstm2
-    cp .env.example .env
+The final ablation uses:
 
-Adjust CUDA_HOME and TORCH_CUDA_ARCH_LIST for the local CUDA toolchain, then open
-main_thesis.ipynb. Individual entry points are also available in experiments/:
+- context length `N = 128`
+- `D = 32` key-value pairs
+- vocabulary size `8192`
+- model widths `d = 4, 8, 16`
+- validation accuracy at query positions
 
-    from experiments.ch_formal_benchmark import run_formal_benchmark
+### Formal languages
 
-    results = run_formal_benchmark(
-        device_str="cuda",
-        benchmark_type="sm_combinations",
-    )
+The formal-language suite tests structured, rule-based sequence processing at
+three levels of the Chomsky hierarchy:
 
-Generated JSON and figures are written under results/ or the notebook working
-directory, depending on the benchmark.
+- Parity — regular
+- Dyck-1 — context-free
+- `aⁿbⁿcⁿ` — context-sensitive
 
-## Limitations
+All three datasets are class-balanced. Models classify at the final sequence
+position after processing the full sequence. The final experiments use sequence
+length 64, hidden and embedding dimension 256, four heads where applicable,
+10,000 training examples, and 2,000 validation examples.
 
-- These are controlled task benchmarks, not production-language-model evaluations.
-- Capacity sweeps shown above contain one run per point; uncertainty is unknown.
-- GPU kernels and timing can depend on the CUDA, compiler, and device combination.
-- Some notebooks preserve exploratory cells and machine-specific paths; the
-  experiment modules are the clearer reference for reproduction.
+## Main findings
 
-Explore the results interactively in the
+- At the informative MQAR width `d = 8`, retaining an mLSTM block is the main
+  determinant of performance. In the direct `MM` versus `TT` comparison, `MM`
+  reaches `92.0 ± 8.8%` validation accuracy and `TT` reaches `28.0 ± 5.2%`.
+- Replacing `M` with `T` in the matched `SM` and `MS` groups produces a
+  statistically significant drop at `d = 8`. Replacing `S` with `L` does not
+  produce a statistically significant change in the same setting.
+- MQAR is at a floor at `d = 4` and near its ceiling at `d = 16`; the thesis
+  therefore bases its component-level conclusion on the non-saturated `d = 8`
+  regime.
+- Across Parity, Dyck-1, and `aⁿbⁿcⁿ`, stacks with at least one scalar-recurrent
+  block (`S` or `L`) outperform the fully matrix-memory `MM` stack in these
+  experiments.
+- Within the scalar-recurrent regime, most `S ↔ L` and isolated `M ↔ T`
+  substitutions remain within the reported uncertainty. No reliable ordering
+  advantage is observed between `SM` and `MS` once a scalar pathway is present.
+
+These conclusions apply to the thesis's small, two-block, capacity-matched
+setting and synthetic benchmarks.
+
+![MQAR ablation results](results/xlstm_ablation/ablation_MM_capacity_panels_N128.png)
+
+![Formal-language ablation results](results/formal_ablation_panels.png)
+
+## Repository structure
+
+- `main_thesis.ipynb` — experiment orchestration and recorded notebook outputs
+- `experiments/mqar_benchmark.py` — MQAR generation, training, evaluation, and
+  capacity sweeps
+- `experiments/ch_formal_benchmark.py` — Parity, Dyck-1, and `aⁿbⁿcⁿ`
+  experiments
+- `utils/model_architectures.py` — the shared hybrid-model wrapper and block
+  implementations
+- `results/xlstm_ablation/` — repeated MQAR runs, summaries, and figures
+- `results/formal_ablation_panels.png` — formal-language ablation figure
+
+## Environment
+
+The committed environment uses Python 3.12, PyTorch 2.5.1, CUDA 12.1, and
+`xlstm` 1.0.8.
+
+```bash
+conda env create -f environment.yml
+conda activate xlstm2
+cp .env.example .env
+```
+
+Set `CUDA_HOME` and `TORCH_CUDA_ARCH_LIST` in `.env` for the local CUDA
+installation, then use `main_thesis.ipynb` to run the benchmark sections.
+
+Explore the experiment results interactively in the
 [portfolio case study](https://medoali.at/work/xlstm-sequence-benchmarks).
