@@ -1,8 +1,8 @@
 # xLSTM Hybrid Benchmarks
 
-An experiment suite for asking a focused question: how do two-block combinations
-of matrix-LSTM, scalar-LSTM, conventional LSTM, and Transformer blocks behave on
-memory-intensive sequence tasks?
+An experiment suite for comparing two-block combinations of matrix-LSTM,
+scalar-LSTM, conventional LSTM, and Transformer blocks on memory-intensive
+sequence tasks.
 
 The repository contains benchmark code, notebooks, committed JSON results, and
 the figures produced from those results. It covers Multi-Query Associative Recall
@@ -28,11 +28,9 @@ both evaluated over the full width range 2, 4, 8, 16, 32, 64, and 128. At width
 8 the recorded validation scores differ sharply (0.984 for MM and 0.532 for TT);
 by width 16 both are approximately 0.987.
 
-This is a capacity observation for this task and training setup—not a claim that
-one architecture is universally better. The capacity points are single runs, so
-the repository does not attach confidence intervals to that curve. Repeated
-formal-language ablations are summarized separately with mean and 95% confidence
-intervals.
+These values describe the recorded task and training configuration. Capacity
+points are reported as single runs, while repeated formal-language ablations are
+summarized separately with their mean and 95% confidence interval.
 
 ![MQAR capacity comparison](results/mm_vs_tt/capacity_panels_N128_train20000_val4000.png)
 
@@ -62,13 +60,15 @@ main_thesis.ipynb. Individual entry points are also available in experiments/:
 Generated JSON and figures are written under results/ or the notebook working
 directory, depending on the benchmark.
 
-## Limitations
+## Evaluation notes
 
-- These are controlled task benchmarks, not production-language-model evaluations.
-- Capacity sweeps shown above contain one run per point; uncertainty is unknown.
-- GPU kernels and timing can depend on the CUDA, compiler, and device combination.
-- Some notebooks preserve exploratory cells and machine-specific paths; the
-  experiment modules are the clearer reference for reproduction.
+- MQAR and formal-language tasks provide controlled tests of sequence memory and
+  architecture behavior.
+- Capacity sweeps report one run per point; repeated formal-language experiments
+  report mean and 95% confidence intervals.
+- Runtime and kernel performance depend on the CUDA, compiler, and GPU
+  configuration.
+- The modules under `experiments/` are the primary entry points for reproduction.
 
 Explore the results interactively in the
 [portfolio case study](https://medoali.at/work/xlstm-sequence-benchmarks).
